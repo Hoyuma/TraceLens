@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "TraceLens",
+  "description": "操作と意図を、実装につなぐ — ブラウザ操作の調査・記録ツール",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "action": { "default_title": "TraceLens を開く（表示中のタブへのアクセスを許可）" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage", "unlimitedStorage"],
+  "optional_host_permissions": ["<all_urls>"],
+  "commands": {
+    "capture-screen": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "画面を保存（表示中のタブへのアクセスも再許可）"
+    }
+  },
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

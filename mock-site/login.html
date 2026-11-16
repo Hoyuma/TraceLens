@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>模擬勤怠 - ログイン</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<form class="box" id="login-form" action="index.html" method="get" onsubmit="event.preventDefault(); location.href='index.html';">
+  <h1 style="font-size:18px;margin:0">模擬勤怠システム</h1>
+  <p style="color:#666;font-size:12px">動作確認用のページです。認証は行いません。</p>
+  <label for="userId">社員番号</label><input id="userId" name="userId" autocomplete="username">
+  <label for="password">パスワード</label><input id="password" name="password" type="password" autocomplete="current-password">
+  <div style="margin-top:14px"><button id="login" type="submit">ログイン</button></div>
+</form>
+</body></html>

@@ -1,0 +1,38 @@
+{
+  "name": "tracelens",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TraceLens - 操作と意図を、実装につなぐ（ブラウザ操作の調査・記録ツール）",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:e2e": "node scripts/build.mjs --e2e",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "mock": "node mock-site/server.mjs",
+    "e2e": "node scripts/build.mjs --e2e && node tests/e2e/run.mjs",
+    "verify:real-permissions": "node scripts/build.mjs && node tests/e2e/real-permissions.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "idb": "^8.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.0.0",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hoyuma/TraceLens.git"
+  }
+}
