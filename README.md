@@ -14,6 +14,7 @@
 | [docs/data-format.md](docs/data-format.md) | データ形式と実装構成 |
 | [docs/verification.md](docs/verification.md) | 実施した検証結果（確認済み／未確認の区別） |
 | [docs/decisions.md](docs/decisions.md) | 設計判断の記録、既知の制限、未実装項目 |
+| [CLAUDE.md](CLAUDE.md) | 開発に参加する人・コーディングエージェント向けの目的、原則、品質基準 |
 | [docs/sample-export.zip](docs/sample-export.zip) | 模擬業務ページの記録から生成した出力ZIPの実例 |
 
 ## 現在の状態
