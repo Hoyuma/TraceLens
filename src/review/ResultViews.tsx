@@ -1,4 +1,5 @@
-import type { ReplayRun, ReplayStepResult } from '../shared/replay';
+import { useState } from 'react';
+import type { ReplayDiagnostics, ReplayRun, ReplayStepResult } from '../shared/replay';
 import { fmtTime } from '../shared/describe';
 import { getLang, replayStatusLabel, t } from '../ui/i18n';
 
@@ -45,7 +46,35 @@ export function StepResultView({ result, run, onEdit }: { result?: ReplayStepRes
       </tbody></table>
       {result.status === 'ok' && <div className="small muted">{t('res.okNote')}</div>}
       {result.status === 'failed' && onEdit && <button className="link small" data-testid="goto-replay-edit" onClick={onEdit}>{t('res.editFailed')}</button>}
+      {result.diag && <DiagView diag={result.diag} open={result.status === 'failed'} />}
     </div>
+  );
+}
+
+const pathText = (p: readonly { index: number; selector?: string }[]) => (p.length ? p.map((h) => `${h.selector ?? '?'}[${h.index}]`).join(' > ') : t('res.diagTop'));
+
+/** 再生の診断ログ（フレーム・セレクター・文書の切り替わり）。失敗した手順では開いた状態で出す */
+export function DiagView({ diag, open }: { diag: ReplayDiagnostics; open?: boolean }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => { void navigator.clipboard?.writeText(JSON.stringify(diag, null, 2)).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }, () => {}); };
+  return (
+    <details data-testid="step-result-diag" open={open} style={{ marginTop: 6 }}>
+      <summary className="small">{t('res.diagTitle')}</summary>
+      <div className="small muted">{t('res.diagNote')}</div>
+      <button className="link small" data-testid="diag-copy" onClick={copy}>{copied ? t('res.diagCopied') : t('res.diagCopy')}</button>
+      <div className="small" style={{ marginTop: 4 }}><b>{t('res.diagLog')}</b></div>
+      <ol className="small" data-testid="diag-log" style={{ margin: 0, paddingLeft: 18, wordBreak: 'break-all' }}>
+        {diag.log.map((x, i) => <li key={i}><span className="muted">{fmtTime(x.at)}</span> {x.text}{x.repeat ? t('res.diagRepeat', { n: x.repeat }) : ''}</li>)}
+      </ol>
+      {diag.truncated ? <div className="small muted">{t('res.diagTruncated', { n: diag.truncated })}</div> : null}
+      <table className="t small" style={{ marginTop: 4, wordBreak: 'break-all' }}><tbody>
+        {diag.recordedFrame && <tr><th style={{ width: 110 }}>{t('res.diagRecordedFrame')}</th><td><code>{pathText(diag.recordedFrame.path)}</code><div className="muted">{diag.recordedFrame.url}</div></td></tr>}
+        {diag.frameId !== undefined && <tr><th>{t('res.diagChosen')}</th><td>frameId={diag.frameId}</td></tr>}
+        {diag.attempts && diag.attempts.length > 0 && <tr><th>{t('res.diagAttempts')}</th><td><ul style={{ margin: 0, paddingLeft: 16 }}>{diag.attempts.map((a, i) => <li key={i}><code>{a.selector}</code> — {a.error ?? a.count}</li>)}</ul></td></tr>}
+        {diag.probe && diag.probe.length > 0 && <tr data-testid="diag-probe"><th>{t('res.diagProbe')}</th><td><ul style={{ margin: 0, paddingLeft: 16 }}>{diag.probe.map((p) => <li key={p.frameId}>frameId={p.frameId} <code>{pathText(p.path)}</code> <span className="muted">{p.url}</span> — {p.counts.map((c) => `${c.selector}: ${c.count ?? '?'}`).join(' / ')}</li>)}</ul></td></tr>}
+        {diag.frames && <tr data-testid="diag-frames"><th>{t('res.diagFrames', { n: diag.frames.length })}</th><td><ul style={{ margin: 0, paddingLeft: 16 }}>{diag.frames.map((f) => <li key={`${f.frameId}-${f.documentId ?? ''}`}>frameId={f.frameId} <code>{pathText(f.path)}</code> <span className="muted">{f.url}{f.readyState ? ` (${f.readyState})` : ''}{f.iframeCount ? ` iframe×${f.iframeCount}` : ''}</span></li>)}</ul></td></tr>}
+      </tbody></table>
+    </details>
   );
 }
 

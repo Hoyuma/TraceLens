@@ -119,7 +119,7 @@ WaitCondition: `kind` = `none` / `element-present` / `element-absent`（`value` 
 ### 再生計画と再生結果 (v2)
 
 - 再生計画（`buildReplayPlan`）は、表示・再生順のうち `replay.skip` でない手順から作ります。`includeInExport` とは独立です。
-- 手順の種別ごとの動作: click / input / select / check / key はそのまま、`session-start` は記録開始時の URL へ移動、`reload` は再読み込み。`navigation` / `spa-navigation` は計画の先頭（または直前が操作でない場合）なら移動、直前がクリックなどの操作なら「その操作の結果として起きる遷移」として URL の一致を待ちます（同じ遷移を二重に起こさない）。`wait` は待機だけ。`notice` `manual-capture` `element-note` `session-end` は再生対象外（理由つきで計画に残り、結果は skipped）。
+- 手順の種別ごとの動作: click / input / select / check / key はそのまま、`session-start` は記録開始時の URL へ移動、`reload` は再読み込み。`navigation` / `spa-navigation` は計画の先頭（または直前が操作でない場合）なら移動、直前がクリックなどの操作なら「その操作の結果として起きる遷移」として URL の一致を待ちます（同じ遷移を二重に起こさない）。操作の後に遷移が続く場合（リダイレクト・フォームの自動送信）は、連鎖のすべてを待機にし、途中の URL を直接開きません。途中の遷移の待機条件は「この遷移先、または同じ連鎖の後続の遷移先」の URL（origin + path、`isRegex: true` の正規表現）です。`wait` は待機だけ。`notice` `manual-capture` `element-note` `session-end` は再生対象外（理由つきで計画に残り、結果は skipped）。
 - 機密欄（`value.kind: 'redacted'`）とファイル選択は自動で入力せず `manual`（人が操作して続行）にします。manual の手順は値を一切持ちません。対象要素のセレクターが無い操作も manual です。
 - セレクターは、人の指定 → 記録時の一致が 1 件で suspect でない候補 → 一致 1 件で suspect → その他、の順に試します（同順位は記録の順）。再生時に一致が 1 件のものだけを使う前提です。
 - 実行前の確認（`preflight`）で、値が決まらない変数（実行時入力が必要な secret の変数を含む）、manual の手順、再生対象外の手順を洗い出します。
@@ -143,6 +143,8 @@ ReplayRun（`replayRuns` ストア）:
 |---|---|
 | `ReplayStepResult.acted` | `ActedState`（`yes` / `possibly` / `no`）。この手順の操作を実行したか。`yes`: 実行した。`possibly`: 実行された可能性がある（応答を受け取れなかった）。`no`: 実行していない。未設定は記録していない（旧データ、または操作を伴わない結果）。再試行で二重操作になり得るかの判断に使う |
 | `ReplayStepResult.stoppedWhileRunning` | 停止の要求を受けたときに実行中だった手順。`true` のとき、`reason` に理由がある。ok にも未実行（pending）にもしない |
+| `ReplayStepResult.diag` | (追加) 診断ログ `ReplayDiagnostics`: `log[]`（`at` `text`、同じ出来事が続いた場合は `repeat` `lastAt`。最大 80 件、超えた件数は `truncated`）、`recordedFrame`（記録時のフレーム経路と URL）、`frames[]`（注入できたフレーム: `frameId` `documentId` `path` `url` `readyState` `iframeCount`。最大 40 件）、`frameId`（選んだフレーム）、`attempts[]`（試したセレクターと再生時点の一致件数）、`probe[]`（対象要素が見つからない場合の、ほかのフレームでの一致件数。診断のみ）。入力値は含めない。省略可能 |
+| `ReplayAction.note` の `NAV_CHAIN_NOTE` | 操作の結果として起きる遷移の連鎖の待機であることの注記。待機の手順の結果の `detail` にも出す |
 | `ReplayAction.note` | 再生の仕方についての注記（記録した再読み込みの再生方法など）。UI と結果に表示する |
 | `ActiveReplay.actedResume` | 手順が操作済みであることの印（`position` `stepId` `attemptId` `startedAt` ほか）。再開時（SW の再起動後を含む）は操作をせず、待機条件の観測だけを行う。印は `chrome.storage.session` に置くため SW の再起動後も有効。手順の結果が確定したら消す |
 | `ActiveReplayWait` の `permission` の `origin` / `originUnknown` | `origin`: 実際にアクセス権が足りないオリジン（UI は `chrome.permissions.request` で要求してから再開する）。`originUnknown`: タブの URL が読めず分からない（`origin` は省略し、UI は任意権限 `<all_urls>` の要求を案内する）。`actedResume`: 操作済みで、再開すると観測だけから続ける |

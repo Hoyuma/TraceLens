@@ -641,16 +641,74 @@ try {
   const r4 = await send({ t: 'ui:replay-start', scenarioId: scId, tabId: recTabId, mode: 'range', fromStepId: dateStepR.id, variableValues: {} });
   await sleep(300);
   await send({ t: 'ui:replay-pause' });
-  const p4 = await waitReplay((r) => r?.status === 'paused' && r.waitReason?.code === 'paused-by-user');
-  await sleep(1500);
+  // 一時停止の要求の時点で実行中だった手順は最後まで実行される（位置が 1 つ進むことがある）。その後は進まないことを確かめる
+  await waitReplay((r) => r?.status === 'paused' && r.waitReason?.code === 'paused-by-user');
+  await sleep(2000);
+  const p4 = (await send({ t: 'ui:replay-state' })).replay;
+  await sleep(2000);
   const p4b = (await send({ t: 'ui:replay-state' })).replay;
-  check('P14', '一時停止すると、実行中の手順の後で止まり、それ以上進まない', r4?.ok && p4.position === p4b.position && p4.position < p4.plan.length, JSON.stringify({ a: p4.position, b: p4b.position, n: p4.plan.length }));
+  check('P14', '一時停止すると、実行中の手順の後で止まり、それ以上進まない', r4?.ok && p4.status === 'paused' && p4.position === p4b.position && p4.position <= 1 && p4.position < p4.plan.length, JSON.stringify({ a: p4.position, b: p4b.position, n: p4.plan.length }));
   await send({ t: 'ui:replay-resume' });
   await waitReplay((r) => r === null, 60000);
   runs = await replayRuns(scId);
   check('P15', '再開すると最後まで実行される（遅れて現れる選択肢を待って選択する）', runs.at(-1).status === 'completed' && runs.at(-1).results.every((x) => x.status === 'ok' || x.status === 'skipped') && /^保存しました/.test(await rec.locator('#status').textContent()), JSON.stringify(runs.at(-1).results.map((x) => [x.status, x.reason ?? ''])));
   const recordedAfter = (await dump(review)).steps.filter((s) => s.scenarioId === scId).length;
   check('P16', '再生で起こした操作は記録に混ざらない（手順数が変わらない）', recordedAfter === rsteps.length, `${rsteps.length} -> ${recordedAfter}`);
+  const p10run = runs.find((x) => x.status === 'failed' && x.results[0]?.stepId === hoursStepR.id);
+  check('P17', '失敗した手順の結果に診断ログ（試したセレクターと件数、フレーム一覧、出来事）が残り、入力値を含まない', !!p10run?.results[0].diag?.attempts?.length && p10run.results[0].diag.attempts.every((a) => a.count === 0) && p10run.results[0].diag.frames?.length >= 1 && p10run.results[0].diag.log.length >= 1 && !JSON.stringify(p10run.results[0].diag).includes(PASSWORD), JSON.stringify(p10run?.results[0].diag ?? null).slice(0, 600));
+
+  // (5) 遷移の連鎖（302 → フォームの自動送信 → トークンつきの画面）と、入れ子の iframe のダイアログ
+  const flowSc = 'scn_e2eflow';
+  await idbPut('scenarios', [{ schemaVersion: 2, id: flowSc, projectId, name: '連鎖遷移とフレームの再生', purpose: '', preconditions: '', expectedResult: '', openQuestions: '', createdAt: nowIso, updatedAt: nowIso, sessions: [], groups: [], replacementRules: [], variables: [] }]);
+  const fl = await context.newPage();
+  await fl.goto(`${BASE}/flow-start.html`);
+  await fl.evaluate(() => localStorage.removeItem('mock.extraFrame'));
+  const flTabId = await sw.evaluate(async () => (await chrome.tabs.query({})).find((t) => t.url?.includes('flow-start.html')).id);
+  await fl.bringToFront();
+  const stF = await send({ t: 'ui:start', scenarioId: flowSc, tabId: flTabId });
+  await sleep(1500);
+  await fl.click('#open-apply');
+  await fl.waitForURL(/\/flow\/form/);
+  await sleep(1800);
+  await fl.click('#apply_type button');
+  await fl.locator('ul.menu li', { hasText: '振替伝票依頼' }).click();
+  await sleep(900);
+  await fl.click('textarea[name="work_request"]'); await fl.keyboard.type('flow-memo', { delay: 20 });
+  await sleep(300);
+  await fl.click('#temp_save');
+  const saveFrame = fl.frameLocator('#GB_window iframe').frameLocator('iframe').frameLocator('iframe');
+  await saveFrame.locator('input[name="matterName"]').waitFor();
+  await sleep(1000); // 人が表示を見てから操作するまでの間（記録用スクリプトは表示の直後に注入される）
+  await saveFrame.locator('input[name="matterName"]').click();
+  await fl.keyboard.type('flow-subject', { delay: 20 });
+  await sleep(500);
+  await saveFrame.locator('#decide').click();
+  await fl.waitForURL(/flow-done\.html/);
+  await sleep(1800);
+  await send({ t: 'ui:stop' });
+  await sleep(800);
+  const fsteps = (await dump(review)).steps.filter((s) => s.scenarioId === flowSc);
+  const navs = fsteps.filter((s) => s.kind === 'navigation');
+  const nameStep = fsteps.find((s) => s.kind === 'input' && s.target?.name === 'matterName');
+  check('P18', '連鎖遷移と入れ子の iframe 内の操作を記録できる（自動送信を含む遷移、深さ 3 のフレーム内の入力と決定）', stF?.ok && navs.length >= 2 && nameStep?.frame.path.length === 3 && fsteps.some((x) => x.kind === 'click' && x.target?.id === 'decide'), JSON.stringify({ kinds: kinds(fsteps), depth: nameStep?.frame.path.length }));
+  // 再生時は画面が少し違う: 隠しフレームが先頭に追加され、ダイアログの iframe の index がずれる
+  await fl.evaluate(() => localStorage.setItem('mock.extraFrame', '1'));
+  const rF = await send({ t: 'ui:replay-start', scenarioId: flowSc, mode: 'all', variableValues: {} });
+  await waitReplay((r) => r === null || r?.waitReason?.code === 'failed-step', 90000);
+  const fstate = (await send({ t: 'ui:replay-state' })).replay;
+  if (fstate) await send({ t: 'ui:replay-stop' });
+  runs = await replayRuns(flowSc);
+  const frun = runs.at(-1);
+  const fres = (id) => frun.results.find((x) => x.stepId === id);
+  const navRes = navs.map((s) => fres(s.id));
+  const donePage = findPage(/flow-done\.html/, [fl]);
+  const doneType = donePage ? await donePage.locator('#done-type').textContent() : null;
+  check('P19', '連鎖遷移の途中の URL を直接開かず、遷移の観測で待つ（遷移の手順はすべて ok、不正な画面遷移にならない）', rF?.ok && navRes.length >= 2 && navRes.every((x) => x?.status === 'ok' && x.acted !== 'yes'),JSON.stringify(navRes.map((x) => [x?.status, x?.reason ?? '', x?.waitOutcome?.status])));
+  check('P20', '入れ子の iframe 内の入力・決定を、iframe の index がずれた画面でも記録時のフレームで再生し、最後まで実行する', !!nameStep && frun.status === 'completed' && fres(nameStep.id)?.status === 'ok' && doneType === '振替伝票依頼', JSON.stringify({ status: frun.status, reason: frun.reason, name: nameStep && fres(nameStep.id), doneType, results: frun.results.map((x) => [x.status, (x.reason ?? '').slice(0, 160)]) }));
+  check('P21', 'フレーム内の手順の診断ログに、選んだフレームと照合方法が残る', !!nameStep && fres(nameStep.id)?.diag?.frameId > 0 && fres(nameStep.id).diag.log.some((l) => /フレームを特定/.test(l.text)), JSON.stringify(nameStep && fres(nameStep.id)?.diag?.log || null).slice(0, 600));
+  await fl.evaluate(() => localStorage.removeItem('mock.extraFrame')).catch(() => {});
+  await fl.close().catch(() => {});
+  if (donePage) await donePage.close().catch(() => {});
 
   // --- 20. ページ全体・要素単位の画像、操作前の画面の参照、新規タブへの切り替え（追加設定を有効にして記録） ---
   await review.evaluate(() => chrome.storage.local.set({ 'tracelens.settings': { beforeShot: true, followNewTab: true } }));

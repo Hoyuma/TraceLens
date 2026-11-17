@@ -339,20 +339,23 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
   let el: Element | null = null;
   let used: ReplaySelector | undefined;
   let options: number[] | undefined;
+  let attempts: SelectorAttempt[] = [];
+  const diagOf = (): Pick<ReplayRunReply, 'attempts' | 'href' | 'iframeCount'> => ({ attempts, ...docDiag(env) });
   if (needsTarget) {
     let lastReason = '';
     for (;;) {
       const f = findTarget(env.doc, a);
+      attempts = f.attempts;
       if (f.ok) {
         if ((a.kind === 'input' || a.kind === 'select' || a.kind === 'check') && sensitive(f.el)) {
-          return { status: 'manual', reason: '機密欄のため自動では操作しない。人が操作して続行する', selectorUsed: sel(f.selector), matchCount: 1 };
+          return { status: 'manual', reason: '機密欄のため自動では操作しない。人が操作して続行する', selectorUsed: sel(f.selector), matchCount: 1, ...diagOf() };
         }
         const r = readiness(a, f.el);
         if (r.ok) { el = f.el; used = f.selector; options = r.options; break; }
         lastReason = r.reason;
-        if (r.fatal) return { status: 'failed', reason: r.reason, selectorUsed: sel(f.selector), matchCount: 1 };
+        if (r.fatal) return { status: 'failed', reason: r.reason, selectorUsed: sel(f.selector), matchCount: 1, ...diagOf() };
       } else lastReason = f.reason;
-      if (now() >= deadline) return { status: 'failed', reason: `上限時間（${a.timeoutMs}ms）までに対象要素を操作できる状態で特定できなかった: ${lastReason}` };
+      if (now() >= deadline) return { status: 'failed', reason: `上限時間（${a.timeoutMs}ms）までに対象要素を操作できる状態で特定できなかった: ${lastReason}`, ...diagOf() };
       await sleep(POLL_MS);
     }
   } else {
@@ -389,11 +392,20 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
   } catch (e) {
     return { status: 'failed', reason: `操作中に例外が発生した: ${(e as Error)?.name ?? 'Error'}`, selectorUsed: sel(used), matchCount: used ? 1 : undefined };
   }
+  const d = diagOf(); // 操作の直後（遷移の前）に文書の情報を控える
   const wo = await waitFor(a.wait, env, Math.max(deadline, now() + MIN_WAIT_AFTER_ACTION_MS), env.quietMaxMs);
-  const rep = waitReply(wo, true);
+  const rep = { ...waitReply(wo, true), ...d };
   if (used) { rep.selectorUsed = sel(used); rep.matchCount = 1; }
   if (note && rep.status === 'ok') rep.reason = note;
   return rep;
+}
+
+/** 診断用: 文書の URL と iframe / frame 要素の数（取得できなければ省く） */
+function docDiag(env: WaitEnv): { href?: string; iframeCount?: number } {
+  const out: { href?: string; iframeCount?: number } = {};
+  try { out.href = env.href ? env.href() : env.win.location.href; } catch { /* ignore */ }
+  try { out.iframeCount = env.doc.querySelectorAll('iframe,frame').length; } catch { /* ignore */ }
+  return out;
 }
 
 function sel(s: ReplaySelector | undefined): ReplayRunReply['selectorUsed'] {
@@ -410,4 +422,4 @@ export function waitReply(wo: WaitOutcome, afterOperation: boolean): ReplayRunRe
 
 // ---- フレームの経路 ---------------------------------------------------------------
 
-export interface FrameDescription { isTop: boolean; path: { index: number; selector?: string }[]; url: string }
+export interface FrameDescription { isTop: boolean; path: { index: number; selector?: string; url?: string }[]; url: string; readyState?: string; iframeCount?: number }

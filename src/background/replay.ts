@@ -16,8 +16,9 @@ import {
   type ActiveReplay, type ActiveReplayWait, type ReplayActedReply, type ReplayPageMsg, type ReplayRunReply, type ReplayUiMsg, type ReplayUiReply, type ToReplayAuxMsg, type ToReplayMsg,
 } from '../shared/messages';
 import { KIND_LABEL } from '../shared/types';
-import { matchFrame, type FrameCandidate } from './replayFrames';
-import { classifyInjectError, decideRunReply, isSameDocumentNavigation, missingOrigin, originOf, reloadTarget, stepEntryMode, stopMode, stoppedStepResult } from './replayLogic';
+import type { ReplayFrameProbe, ReplayFrameSeen, ReplaySelector } from '../shared/replay';
+import { describePath, matchFrame, type FrameCandidate } from './replayFrames';
+import { DiagLog, classifyInjectError, decideRunReply, documentChanged, isSameDocumentNavigation, missingOrigin, originOf, reloadTarget, stepEntryMode, stopMode, stoppedStepResult, type DocIds } from './replayLogic';
 
 const iso = (ms: number = Date.now()) => new Date(ms).toISOString();
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -35,6 +36,15 @@ const KEEPALIVE_MS = 20_000;
 const SAME_DOC_SETTLE_MS = 2_000;
 /** 現在の URL が読めず、移動先に # がある場合: 読み込みの開始を観測できなくても、この時間の後に読み込み済みとみなす */
 const UNKNOWN_DOC_FALLBACK_MS = 3_000;
+/**
+ * タブが読み込み中のままでも、この時間が過ぎ、トップの移動の保留（pendingUrl）がなく、トップの文書が読み込み済みなら注入する。
+ * フレームを多用する画面では、フレーム内の読み込みが続いてタブが読み込み中のままになり、上限時間まで待ってしまうことがあるため
+ */
+const LOADING_SETTLE_MS = 1_500;
+/** 文書の識別子・状態の問い合わせの上限（ダイアログの表示中などで応答がない場合に打ち切る） */
+const PROBE_TIMEOUT_MS = 1_500;
+/** 操作した後に対象フレームがなくなった場合、この時間待っても見つからなければトップの文書で待機条件を観測する */
+const FRAME_GONE_FALLBACK_MS = 1_500;
 
 // ---- 状態 -------------------------------------------------------------------
 let cache: ActiveReplay | null | undefined;
@@ -64,7 +74,7 @@ export async function isReplayActive(): Promise<boolean> { return !!(await getR(
 // ---- 停止の伝達 ----------------------------------------------------------------
 /** 停止の要求で実行中の手順を打ち切るための例外（drive が受けて、実行中の手順を「停止時に実行中」として確定する） */
 class StopSignal extends Error { constructor() { super('replay stopped'); } }
-interface ExecCtx { signal: AbortSignal; /** 移動（tabs.update）を発行した */ navIssued: boolean }
+interface ExecCtx { signal: AbortSignal; /** 移動（tabs.update）を発行した */ navIssued: boolean; /** 診断ログ */ diag: DiagLog }
 /** 実行中の手順（drive の中だけで設定する） */
 let currentExec: { runId: string; ctl: AbortController } | null = null;
 
@@ -82,19 +92,37 @@ const nap = (ms: number, ctx: ExecCtx) => race(sleep(ms), ctx);
 // ---- 注入とページ呼び出し -----------------------------------------------------
 type Ready = { ok: true } | { ok: false; code: 'permission' | 'restricted' | 'tab-gone' | 'timeout'; message: string; /** permission: 注入できなかったページの URL（分かる場合） */ url?: string };
 
+/** トップの文書の読み込み状態（document.readyState）。読めなければ undefined */
+async function topReadyState(tabId: number): Promise<string | undefined> {
+  const r = await withTimeout(chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, func: () => document.readyState }).catch(() => null), PROBE_TIMEOUT_MS);
+  return r && r !== 'timeout' ? (r[0]?.result as string | undefined) : undefined;
+}
+
 async function ensureReady(tabId: number, deadline: number, ctx: ExecCtx): Promise<Ready> {
   let last = '';
+  let loadingSince: number | undefined;
   for (;;) {
     check(ctx);
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) return { ok: false, code: 'tab-gone', message: '対象タブが閉じられた' };
-    if (tab.status !== 'loading') {
+    let proceed = tab.status !== 'loading';
+    if (proceed) loadingSince = undefined;
+    else {
+      loadingSince ??= Date.now();
+      // フレーム内の読み込みでタブが読み込み中のままになる画面: トップの移動が保留されておらず、トップの文書が読み込み済みなら続行する
+      if (!tab.pendingUrl && Date.now() - loadingSince >= LOADING_SETTLE_MS && (await topReadyState(tabId)) === 'complete') {
+        proceed = true;
+        ctx.diag.add('タブは読み込み中のままだが、トップの移動の保留がなく、トップの文書は読み込み済み（readyState=complete）。フレーム内の読み込みが続いているとみなして続行した');
+      }
+    }
+    if (proceed) {
       try {
         await race(chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['replay.js'], injectImmediately: true }), ctx);
         return { ok: true };
       } catch (e) {
         if (e instanceof StopSignal) throw e;
         last = String((e as Error)?.message || e);
+        ctx.diag.add(`再生スクリプトの注入に失敗: ${last}`);
         const c = classifyInjectError(last);
         if (c.code === 'restricted') return { ok: false, code: 'restricted', message: `再生スクリプトを注入できないページ（ブラウザ内部ページなど）: ${last}` };
         if (c.code === 'permission') {
@@ -106,21 +134,102 @@ async function ensureReady(tabId: number, deadline: number, ctx: ExecCtx): Promi
         }
       }
     }
-    if (Date.now() >= deadline) return { ok: false, code: 'timeout', message: last ? `再生スクリプトを注入できなかった: ${last}` : 'ページの読み込みが上限時間内に終わらなかった' };
+    if (Date.now() >= deadline) {
+      ctx.diag.add(`注入を打ち切った（タブの状態: ${tab.status ?? '不明'}${tab.pendingUrl ? '、移動の保留あり' : ''}）`);
+      return { ok: false, code: 'timeout', message: last ? `再生スクリプトを注入できなかった: ${last}` : 'ページの読み込みが上限時間内に終わらなかった' };
+    }
     await nap(150, ctx);
   }
 }
 
-async function resolveFrame(tabId: number, path: FrameHop[], ctx: ExecCtx): Promise<{ frameId: number } | { error: string }> {
-  if (!path.length) return { frameId: 0 };
+type FrameRes = { frameId: number; documentId?: string; topDocumentId?: string; frames: FrameCandidate[] };
+
+/** 注入できた全フレームの経路を集める（診断ログにも残す） */
+async function describeFrames(tabId: number, ctx: ExecCtx): Promise<FrameCandidate[]> {
+  const res = await race(chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: () => (window as any).__tracelensReplay?.describe?.() ?? null }), ctx);
+  const seen: ReplayFrameSeen[] = [];
+  const frames: FrameCandidate[] = [];
+  for (const r of res) {
+    if (!r.result) continue;
+    const d = r.result as { path: FrameCandidate['path']; url: string; readyState?: string; iframeCount?: number };
+    frames.push({ frameId: r.frameId, documentId: r.documentId, path: d.path, url: d.url });
+    seen.push({ frameId: r.frameId, documentId: r.documentId, path: d.path, url: d.url, readyState: d.readyState, iframeCount: d.iframeCount });
+  }
+  ctx.diag.frames(seen);
+  return frames;
+}
+
+async function resolveFrame(tabId: number, path: FrameHop[], ctx: ExecCtx, frameUrl?: string): Promise<FrameRes | { error: string }> {
   try {
-    const res = await race(chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: () => (window as any).__tracelensReplay?.describe?.() ?? null }), ctx);
-    const frames: FrameCandidate[] = res.filter((r) => r.result).map((r) => ({ frameId: r.frameId, ...(r.result as { path: FrameCandidate['path']; url: string }) }));
-    return matchFrame(frames, path);
+    const frames = await describeFrames(tabId, ctx);
+    const top = frames.find((f) => f.path.length === 0);
+    const m = matchFrame(frames, path, frameUrl);
+    if ('error' in m) { ctx.diag.add(`フレームを特定できない: ${m.error}`); return m; }
+    ctx.diag.set('frameId', m.frameId);
+    if (path.length) ctx.diag.add(`フレームを特定: frameId=${m.frameId}（照合: ${m.via ?? '—'}、経路: ${describePath(path)}）`);
+    return { frameId: m.frameId, documentId: m.documentId, topDocumentId: top?.documentId, frames };
   } catch (e) {
     if (e instanceof StopSignal) throw e;
-    return { error: `フレームの情報を取得できなかった: ${String((e as Error)?.message || e)}` };
+    const error = `フレームの情報を取得できなかった: ${String((e as Error)?.message || e)}`;
+    ctx.diag.add(error);
+    return { error };
   }
+}
+
+/** トップと対象フレームの現在の documentId */
+async function currentDocIds(tabId: number, frameId: number): Promise<DocIds | 'unreachable' | 'unknown'> {
+  const ids = frameId === 0 ? [0] : [0, frameId];
+  let failed = false;
+  const r = await withTimeout(chrome.scripting.executeScript({ target: { tabId, frameIds: ids }, func: () => 0 }).catch(() => { failed = true; return null; }), PROBE_TIMEOUT_MS);
+  if (r === 'timeout') return 'unknown';
+  if (!r || failed) return 'unreachable';
+  const top = r.find((x) => x.frameId === 0)?.documentId;
+  const target = r.find((x) => x.frameId === frameId)?.documentId;
+  if (frameId !== 0 && !target) return 'unreachable';
+  return { top, target };
+}
+
+/** 送り先: 文書が分かれば documentId で送る（切り替わった後の別の文書に届かないように） */
+const sendTarget = (f: { frameId: number; documentId?: string }): chrome.tabs.MessageSendOptions => (f.documentId ? { documentId: f.documentId } : { frameId: f.frameId });
+
+/** 対象要素が見つからない場合に、ほかのフレームで同じセレクターを数える（診断のみ。そのフレームでは操作しない） */
+async function probeFrames(tabId: number, selectors: readonly ReplaySelector[], frames: readonly FrameCandidate[], ctx: ExecCtx): Promise<ReplayFrameProbe[]> {
+  const sels = selectors.filter((s) => s.scope !== 'shadow-root').slice(0, 8).map((s) => ({ language: s.language, selector: s.selector }));
+  if (!sels.length) return [];
+  try {
+    const res = await race(chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [sels],
+      func: (list: { language: 'css' | 'xpath'; selector: string }[]) => list.map((s) => {
+        try {
+          if (s.language === 'xpath') return { selector: s.selector, count: document.evaluate(s.selector, document, null, 7, null).snapshotLength };
+          return { selector: s.selector, count: document.querySelectorAll(s.selector).length };
+        } catch { return { selector: s.selector, count: null }; }
+      }),
+    }), ctx);
+    const out: ReplayFrameProbe[] = [];
+    for (const r of res) {
+      const counts = (r.result as { selector: string; count: number | null }[] | undefined) ?? [];
+      if (!counts.some((c) => (c.count ?? 0) > 0)) continue;
+      const f = frames.find((x) => x.frameId === r.frameId);
+      out.push({ frameId: r.frameId, path: f?.path.map((h) => ({ index: h.index, ...(h.selector ? { selector: h.selector } : {}) })) ?? [], url: f?.url ?? '', counts });
+    }
+    return out.slice(0, 20);
+  } catch (e) {
+    if (e instanceof StopSignal) throw e;
+    ctx.diag.add(`ほかのフレームの調査に失敗: ${String((e as Error)?.message || e)}`);
+    return [];
+  }
+}
+
+/** 調査の結果を理由に添える文 */
+async function probeNote(tabId: number, action: ResolvedReplayAction, exclude: number | undefined, frames: readonly FrameCandidate[], ctx: ExecCtx): Promise<string> {
+  const p = (await probeFrames(tabId, action.selectors, frames, ctx)).filter((x) => x.frameId !== exclude);
+  ctx.diag.set('probe', p);
+  const unique = p.filter((x) => x.counts.some((c) => c.count === 1));
+  if (!p.length) { ctx.diag.add('ほかのフレームにも、同じセレクターに一致する要素はなかった'); return ''; }
+  ctx.diag.add(`ほかのフレームで一致する要素があった: ${p.map((x) => `frameId=${x.frameId}（${describePath(x.path)}、${x.url}）`).join(' / ')}`);
+  return `。診断: 記録時のフレームとは別のフレーム ${p.length} 件で同じセレクターに一致する要素があった（1 件だけ一致: ${unique.length} フレーム）。記録時のフレームとの対応を確認できないため、そこでは操作していない。詳細は診断ログを参照`;
 }
 
 /** 応答がない場合に打ち切る */
@@ -182,25 +291,44 @@ async function waitNavigated(tabId: number, epoch0: number, deadline: number, ct
 }
 
 /** 待機条件だけをページで観測する（文書が切り替わったら新しい文書で観測し直す。長い待機は区切って問い合わせ直す） */
-async function pageWait(r: ActiveReplay, cond: WaitCondition, frame: FrameHop[], deadline: number, ctx: ExecCtx): Promise<{ wo: WaitOutcome } | { ready: Extract<Ready, { ok: false }> } | { error: string }> {
+/**
+ * opts.frameGoneFallback: 対象フレームが見つからない状態が続いた場合（操作でダイアログのフレームが閉じた・トップが遷移したなど）、
+ * トップの文書で観測する。結果の usedTop でそのことを知らせる（理由に明記する）。
+ */
+async function pageWait(r: ActiveReplay, cond: WaitCondition, frame: FrameHop[], deadline: number, ctx: ExecCtx, opts: { frameUrl?: string; frameGoneFallback?: boolean } = {}): Promise<({ wo: WaitOutcome; usedTop?: boolean }) | { ready: Extract<Ready, { ok: false }> } | { error: string }> {
   if (cond.kind === 'none') return { wo: { kind: 'none', status: 'not-applicable' } };
-  const path = cond.kind === 'url-matches' ? [] : frame;
+  let path = cond.kind === 'url-matches' ? [] : frame;
+  let usedTop = false;
+  const t0 = Date.now();
+  ctx.diag.add(`待機条件の観測を開始: ${cond.kind}${cond.value ? ` ${cond.isRegex ? '/' : '「'}${cond.value}${cond.isRegex ? '/' : '」'}` : ''}${path.length ? `（フレーム: ${describePath(path)}）` : '（トップ）'}`);
   for (;;) {
     const ready = await ensureReady(r.tabId, deadline, ctx);
     if (!ready.ok) return { ready };
-    const f = await resolveFrame(r.tabId, path, ctx);
-    if ('error' in f) { if (Date.now() >= deadline) return { error: f.error }; await nap(200, ctx); continue; }
+    const f = await resolveFrame(r.tabId, path, ctx, opts.frameUrl);
+    if ('error' in f) {
+      if (opts.frameGoneFallback && path.length && Date.now() - t0 >= FRAME_GONE_FALLBACK_MS) {
+        path = []; usedTop = true;
+        ctx.diag.add('操作したフレームが見つからないため、待機条件はトップの文書で観測する');
+        continue;
+      }
+      if (Date.now() >= deadline) return { error: f.error };
+      await nap(200, ctx); continue;
+    }
     const epoch = await currentEpoch();
+    const before: DocIds = { top: f.topDocumentId, target: f.documentId };
     const remaining = Math.max(deadline - Date.now(), 500);
     // dom-quiet は「上限まで静止しなかった」も結果として使うため区切らない
     const chunk = cond.kind === 'dom-quiet' ? remaining : Math.min(remaining, WAIT_CHUNK_MS);
-    const reply = await race(withTimeout(chrome.tabs.sendMessage(r.tabId, { t: 'replay:wait', runId: r.runId, wait: cond, timeoutMs: chunk } satisfies ToReplayAuxMsg, { frameId: f.frameId }).catch(() => null) as Promise<ReplayRunReply | null>, chunk + REPLY_GRACE_MS), ctx);
-    if (reply === 'timeout') return { error: 'ページから応答がない（ダイアログの表示中などでページのスクリプトが止まっている可能性がある）' };
+    const reply = await race(withTimeout(chrome.tabs.sendMessage(r.tabId, { t: 'replay:wait', runId: r.runId, wait: cond, timeoutMs: chunk } satisfies ToReplayAuxMsg, sendTarget(f)).catch(() => null) as Promise<ReplayRunReply | null>, chunk + REPLY_GRACE_MS), ctx);
+    if (reply === 'timeout') { ctx.diag.add('待機条件の観測に応答がない'); return { error: 'ページから応答がない（ダイアログの表示中などでページのスクリプトが止まっている可能性がある）' }; }
     // 応答の途中で文書が切り替わった場合、古い文書での観測結果は使わない
-    if (reply && reply.waitOutcome && (await currentEpoch()) === epoch) {
+    const ch = documentChanged(before, await currentDocIds(r.tabId, f.frameId), (await currentEpoch()) !== epoch);
+    if (reply && reply.waitOutcome && !ch.changed) {
       if (reply.waitOutcome.status === 'timeout' && cond.kind !== 'dom-quiet' && Date.now() < deadline - 100) continue; // 区切りの時間切れ。上限まで問い合わせ直す
-      return { wo: reply.waitOutcome };
+      ctx.diag.add(`待機条件の結果: ${reply.waitOutcome.status}${reply.href ? `（観測した文書: ${reply.href}）` : ''}`);
+      return { wo: reply.waitOutcome, ...(usedTop ? { usedTop } : {}) };
     }
+    ctx.diag.add(reply ? `観測中に文書が切り替わったため、結果を使わず観測し直す（判定: ${ch.basis}）` : `観測の応答を受け取れなかった（文書の切り替わり: ${ch.changed ? 'あり' : 'なし'}、判定: ${ch.basis}）`);
     if (Date.now() >= deadline) return { wo: { kind: cond.kind, status: 'timeout', at: iso(), detail: 'ページの切り替わりが続き、上限時間内に条件を観測できなかった' } };
     await nap(100, ctx);
   }
@@ -217,7 +345,7 @@ const joinDetail = (...xs: (string | undefined)[]) => xs.filter(Boolean).join('�
 async function observeAfterAct(r: ActiveReplay, a: ReplayAction, action: ResolvedReplayAction, startedAt: string, deadline: number, extra: Partial<ReplayStepResult>, ctx: ExecCtx): Promise<Outcome> {
   const t0 = Date.now();
   while ((await chrome.tabs.get(r.tabId).catch(() => null))?.status === 'loading' && Date.now() - t0 < LOAD_TIMEOUT_MIN_MS) await nap(100, ctx);
-  const w = await pageWait(r, action.wait, action.frame, Math.max(deadline, Date.now() + 1500), ctx);
+  const w = await pageWait(r, action.wait, action.frame, Math.max(deadline, Date.now() + 1500), ctx, { frameUrl: action.frameUrl, frameGoneFallback: true });
   if ('ready' in w) {
     if (w.ready.code === 'permission') {
       const o = missingOrigin(w.ready.url);
@@ -231,7 +359,8 @@ async function observeAfterAct(r: ActiveReplay, a: ReplayAction, action: Resolve
     return readyFailure(w.ready, startedAt, a.stepId, undefined, extra);
   }
   if ('error' in w) return failed(a.stepId, startedAt, w.error, extra);
-  return { kind: 'done', result: resultFromWait(a.stepId, startedAt, w.wo, extra) };
+  const ex = w.usedTop ? { ...extra, detail: joinDetail(extra.detail, '操作したフレームが操作の後に見つからなくなった（ダイアログが閉じた・ページが遷移したなど）ため、待機条件はトップの文書で観測した') } : extra;
+  return { kind: 'done', result: resultFromWait(a.stepId, startedAt, w.wo, ex) };
 }
 
 async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise<Outcome> {
@@ -281,6 +410,7 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
       if (!target) return failed(a.stepId, startedAt, '移動先の URL がない', { acted: 'no' });
       const same = action.reload ? false : isSameDocumentNavigation(tab.url, target);
       check(ctx);
+      ctx.diag.add(`URL を開く: ${target}（移動前: ${tab.url ?? '不明'}）`);
       try {
         await chrome.tabs.update(r.tabId, { url: target });
         ctx.navIssued = true;
@@ -312,10 +442,16 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
 
   // ---- 待機だけの手順 ----
   if (action.kind === 'wait') {
-    const w = await pageWait(r, action.wait, action.frame, deadline, ctx);
-    if ('ready' in w) return readyFailure(w.ready, startedAt, a.stepId, action.frameUrl, { acted: 'no' });
-    if ('error' in w) return failed(a.stepId, startedAt, w.error, { acted: 'no' });
-    return { kind: 'done', result: resultFromWait(a.stepId, startedAt, w.wo) };
+    if (a.note) ctx.diag.add(a.note);
+    const w = await pageWait(r, action.wait, action.frame, deadline, ctx, { frameUrl: action.frameUrl });
+    const extra = a.note ? { detail: a.note } : {};
+    if ('ready' in w) return readyFailure(w.ready, startedAt, a.stepId, action.frameUrl, { acted: 'no', ...extra });
+    if ('error' in w) return failed(a.stepId, startedAt, w.error, { acted: 'no', ...extra });
+    if (w.wo.status !== 'observed' && action.wait.kind === 'url-matches') {
+      const t = await chrome.tabs.get(r.tabId).catch(() => null);
+      ctx.diag.add(`観測を終えた時点のタブの URL: ${t?.url ?? '不明'}${t?.pendingUrl ? `（移動の保留: ${t.pendingUrl}）` : ''}`);
+    }
+    return { kind: 'done', result: resultFromWait(a.stepId, startedAt, w.wo, extra) };
   }
 
   // ---- 操作 ----
@@ -329,14 +465,17 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
     }, ctx);
   }
   let lastReason: string | undefined;
+  ctx.diag.set('recordedFrame', { path: action.frame, url: action.frameUrl });
   for (;;) {
     const ready = await ensureReady(r.tabId, deadline, ctx);
     if (!ready.ok) return readyFailure(ready, startedAt, a.stepId, action.frameUrl, { acted: 'no' });
     await showOverlay(r, progress, ctx);
-    const f = await resolveFrame(r.tabId, action.frame, ctx);
+    const f = await resolveFrame(r.tabId, action.frame, ctx, action.frameUrl);
     if ('error' in f) {
       if (Date.now() < deadline) { await nap(200, ctx); continue; }
-      return failed(a.stepId, startedAt, f.error, { acted: 'no' });
+      let frames: FrameCandidate[] = [];
+      try { frames = await describeFrames(r.tabId, ctx); } catch (e) { if (e instanceof StopSignal) throw e; }
+      return failed(a.stepId, startedAt, `${f.error}${await probeNote(r.tabId, action, undefined, frames, ctx)}`, { acted: 'no' });
     }
     check(ctx);
     const attemptId = newId('att');
@@ -349,16 +488,26 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
     });
     if (!ok) { check(ctx); return { kind: 'stale' }; }
     const epoch = await currentEpoch();
+    const before: DocIds = { top: f.topDocumentId, target: f.documentId };
     const remaining = Math.max(deadline - Date.now(), 1000);
     const msg: ToReplayMsg = { t: 'replay:run', runId: r.runId, attemptId, action: { ...action, timeoutMs: remaining } };
     let failedSend = false;
-    const reply = await race(withTimeout((chrome.tabs.sendMessage(r.tabId, msg, { frameId: f.frameId }) as Promise<ReplayRunReply | undefined>).catch(() => { failedSend = true; return undefined; }), remaining + REPLY_GRACE_MS + 1500), ctx);
+    let sendError = '';
+    const reply = await race(withTimeout((chrome.tabs.sendMessage(r.tabId, msg, sendTarget(f)) as Promise<ReplayRunReply | undefined>).catch((e) => { failedSend = true; sendError = String((e as Error)?.message || e); return undefined; }), remaining + REPLY_GRACE_MS + 1500), ctx);
+    // 文書の切り替わりは documentId で判断する（フレーム内の読み込みでタブの状態が変わっても、トップの文書が同じなら切り替わりではない）
+    const ch = documentChanged(before, await currentDocIds(r.tabId, f.frameId), (await currentEpoch()) !== epoch);
+    if (reply === 'timeout') ctx.diag.add('操作の応答が上限時間内に届かなかった');
+    else if (reply) {
+      if (reply.attempts) ctx.diag.set('attempts', reply.attempts);
+      ctx.diag.add(`ページの応答: ${reply.status}${reply.href ? `（文書: ${reply.href}` : '（'}${reply.iframeCount !== undefined ? `、iframe/frame ${reply.iframeCount} 個` : ''}）`);
+    } else ctx.diag.add(`操作の応答を受け取れなかった${sendError ? `: ${sendError}` : ''}`);
+    if (ch.changed) ctx.diag.add(`操作の前後で文書が切り替わった（判定: ${ch.basis}）`);
     // 試行を締める: 以後、この試行についてのページからの replay:acted は受け付けない（操作したかを確定させる）
     const dec = await withLock(async () => {
       const cur = await getR();
       if (!cur || cur.runId !== r.runId) return null;
       const acted = cur.inFlight?.attemptId === attemptId && cur.inFlight.acted;
-      const d = decideRunReply({ reply, acted, docChanged: cur.docEpoch !== epoch, failedSend, pastDeadline: Date.now() >= deadline, lastReason });
+      const d = decideRunReply({ reply, acted, docChanged: ch.changed, failedSend, pastDeadline: Date.now() >= deadline, lastReason });
       cur.inFlight = undefined;
       // 操作の後に観測し直す場合は、印を残してから観測する（この間に SW が再起動しても、再開時に操作し直さない）
       if (d.kind === 'observe-after-act') cur.actedResume = { position: a.index, stepId: a.stepId, attemptId, acted: true, startedAt, selectorUsed: reply !== 'timeout' ? reply?.selectorUsed : undefined, matchCount: reply !== 'timeout' ? reply?.matchCount : undefined };
@@ -369,8 +518,12 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
     const rep = reply !== 'timeout' ? reply : undefined;
     switch (dec.kind) {
       case 'fail': return failed(a.stepId, startedAt, dec.reason, { acted: dec.acted });
-      case 'use-reply':
-        return { kind: 'done', result: { stepId: a.stepId, status: rep!.status, reason: rep!.reason, selectorUsed: rep!.selectorUsed, matchCount: rep!.matchCount, waitOutcome: rep!.waitOutcome, startedAt, endedAt: rep!.status === 'manual' ? undefined : iso(), acted: dec.acted } };
+      case 'use-reply': {
+        let reason = rep!.reason;
+        // 対象要素が見つからなかった: ほかのフレームに同じ要素がないか調べ、理由に添える（そこでは操作しない）
+        if (rep!.status === 'failed' && !rep!.selectorUsed && rep!.attempts?.length) reason = `${reason ?? ''}${await probeNote(r.tabId, action, f.frameId, f.frames, ctx)}`;
+        return { kind: 'done', result: { stepId: a.stepId, status: rep!.status, reason, selectorUsed: rep!.selectorUsed, matchCount: rep!.matchCount, waitOutcome: rep!.waitOutcome, startedAt, endedAt: rep!.status === 'manual' ? undefined : iso(), acted: dec.acted } };
+      }
       case 'manual': return { kind: 'done', result: { stepId: a.stepId, status: 'manual', reason: rep?.reason, startedAt } };
       case 'observe-after-act':
         // 操作の後に文書が切り替わった（ページ遷移）。古い文書での観測結果は使わず、新しい文書で待機条件を観測する
@@ -438,13 +591,18 @@ async function drive(): Promise<void> {
       notify();
       const ctl = new AbortController();
       currentExec = { runId: r.runId, ctl };
-      const ctx: ExecCtx = { signal: ctl.signal, navIssued: false };
+      const ctx: ExecCtx = { signal: ctl.signal, navIssued: false, diag: new DiagLog() };
       let out: Outcome | { kind: 'stopped' };
       try { out = await execStep(r, action, ctx); }
       catch (e) {
         out = e instanceof StopSignal ? { kind: 'stopped' }
           : { kind: 'done', result: { stepId: action.stepId, status: 'failed', reason: `再生の制御で例外が発生した: ${String((e as Error)?.message || e)}`, startedAt: iso(), endedAt: iso() } };
       } finally { currentExec = null; }
+      // 診断ログを手順の結果に添える（入力値は含めない）
+      if (!ctx.diag.empty && (out.kind === 'done' || (out.kind === 'pause' && out.result))) {
+        const res = out.kind === 'done' ? out.result : out.result!;
+        res.diag = ctx.diag.snapshot();
+      }
       if (out.kind === 'stale') continue;
       if (out.kind === 'stopped') {
         // 停止の要求で打ち切った。実行中だった手順を「停止時に実行中」として確定し、ループの先頭で run を確定する

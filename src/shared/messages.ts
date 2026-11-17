@@ -1,5 +1,5 @@
 // 拡張内メッセージの型（コンテンツスクリプト ⇔ Service Worker ⇔ UI）
-import type { ActedState, PreflightResult, ReplayAction, ReplayMode, ReplayStepResult, ResolvedReplayAction, WaitOutcome } from './replay';
+import type { ActedState, PreflightResult, ReplayAction, ReplayMode, ReplaySelectorAttempt, ReplayStepResult, ResolvedReplayAction, WaitOutcome } from './replay';
 import type { WaitCondition } from './types';
 import type { ChangeKind, RefShot } from './beforeShot';
 import type { TabRef } from './tabSwitch';
@@ -187,6 +187,11 @@ export interface ReplayRunReply {
   selectorUsed?: ReplayStepResult['selectorUsed'];
   matchCount?: number;
   waitOutcome?: WaitOutcome;
+  /** (追加) 診断用: 最後に試したセレクターと一致件数 */
+  attempts?: ReplaySelectorAttempt[];
+  /** (追加) 診断用: 応答した文書の URL と、文書内の iframe / frame 要素の数 */
+  href?: string;
+  iframeCount?: number;
 }
 
 export type ActiveReplayWait =

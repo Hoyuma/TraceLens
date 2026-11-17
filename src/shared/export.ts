@@ -462,7 +462,10 @@ function replayResultLine(c: MdCtx, st: Step): string[] {
   const r = c.runResult.get(st.id);
   if (!r) return ['- 再生で観測した結果: この手順は直近の再生に含まれていない'];
   const extra = [r.reason ? `理由: ${md(r.reason)}` : '', r.selectorUsed ? `使用したセレクター: \`${md(r.selectorUsed.selector)}\`` : '', r.matchCount !== undefined ? `一致件数: ${r.matchCount}` : '', r.waitOutcome ? `待機条件: ${r.waitOutcome.status}` : ''].filter(Boolean).join(' / ');
-  return [`- 再生で観測した結果（業務処理の完了を意味しない）: ${REPLAY_STATUS_LABEL[r.status]}${extra ? `（${extra}）` : ''}`];
+  const L = [`- 再生で観測した結果（業務処理の完了を意味しない）: ${REPLAY_STATUS_LABEL[r.status]}${extra ? `（${extra}）` : ''}`];
+  if (r.detail) L.push(`  - 補足: ${md(r.detail)}`);
+  if (r.diag) L.push('  - 再生の診断ログ（フレーム・セレクター・文書の切り替わりの観測）: steps.json の replayResult.diag を参照');
+  return L;
 }
 
 function originLine(st: Step): string[] {

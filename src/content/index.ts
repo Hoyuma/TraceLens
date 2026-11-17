@@ -456,11 +456,15 @@ declare global { interface Window { __tracelensContent?: boolean } }
   window.addEventListener('hashchange', () => setTimeout(checkUrl, 0));
   try { (window as any).navigation?.addEventListener('currententrychange', () => setTimeout(checkUrl, 0)); } catch { /* 未対応ブラウザ */ }
   setInterval(() => { if (active()) checkUrl(); else lastHref = location.href; }, 500);
-  if (isTop) {
+  {
+    // iframe / frame の読み込みを検知して、SW に全フレームへの注入をやり直させる。
+    // トップだけでなく各フレームで検知する: フレームの中にあとから追加された入れ子のフレーム（ダイアログ内の処理用フレームなど）の
+    // 読み込みは、そのフレームの文書でしか観測できないため（トップだけで検知していたときは、入れ子のフレーム内の操作を記録できなかった）
     let ft: number | undefined;
     document.addEventListener('load', (e) => {
-      if (!active() || (e.target as Element)?.tagName !== 'IFRAME') return;
-      clearTimeout(ft); ft = window.setTimeout(() => void send({ t: 'frames-changed' }), 300);
+      const tag = (e.target as Element)?.tagName;
+      if (!active() || (tag !== 'IFRAME' && tag !== 'FRAME')) return;
+      clearTimeout(ft); ft = window.setTimeout(() => void send({ t: 'frames-changed' }), 80);
     }, true);
   }
 

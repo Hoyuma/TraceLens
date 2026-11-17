@@ -114,6 +114,24 @@ function urlContainsValue(url: string): string {
   try { const u = new URL(url); return `${u.origin}${u.pathname}`; } catch { return url; }
 }
 
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** 操作の結果として起きる遷移の連鎖（リダイレクト・自動送信を含む）の再生の仕方 */
+export const NAV_CHAIN_NOTE = '直前の操作の結果として起きる遷移（リダイレクト・フォームの自動送信を含む連続した遷移）のため、URL を直接開かず、遷移の観測で待つ。途中の画面は短時間で次へ進むことがあるため、同じ連鎖の後続の遷移先に達していても一致とみなす';
+
+/**
+ * 遷移の連鎖の待機条件: この遷移先、または同じ連鎖の後続の遷移先（origin + path）のいずれかを URL に含む。
+ * 後続がなければ従来どおり部分一致の文字列。
+ */
+export function chainUrlWait(urls: readonly string[]): WaitCondition {
+  const vals = [...new Set(urls.map(urlContainsValue))];
+  if (vals.length === 1) return { kind: 'url-matches', value: vals[0] };
+  return { kind: 'url-matches', value: vals.map(escapeRegex).join('|'), isRegex: true };
+}
+
+const isNav = (s: Step) => s.kind === 'navigation' || s.kind === 'spa-navigation';
+const navUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
+
 /**
  * 再生計画を作る（scenario に属する手順だけを使う）。範囲の ID が見つからない場合は Error を投げる。
  * - 対象: orderedSteps のうち replay.skip でないもの（includeInExport とは独立）
@@ -122,6 +140,9 @@ function urlContainsValue(url: string): string {
  * - navigation / spa-navigation: 計画の先頭、または直前の手順が操作でない場合は navigate。
  *   直前が操作（クリック等）の場合は、その操作の結果として起きる遷移とみなし url-matches の wait にする
  *   （同じ遷移を二重に起こして重複登録につながるのを避ける）。
+ *   操作の後に遷移が続く場合（リダイレクト・フォームの自動送信）は、連鎖のすべてを wait にする。
+ *   連鎖の途中の URL を直接開くと、POST の本文や使い捨てのトークンが失われ、別の画面になるため
+ *   （実際の業務サイトで、自動送信の画面とトークン付き URL を GET で開き直して後続の手順が失敗した）。
  */
 export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly Step[], opts: ReplayPlanOptions = {}): ReplayAction[] {
   const all = orderedSteps(steps.filter((s) => s.scenarioId === scenario.id));
@@ -176,8 +197,18 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
       case 'session-start': return { ...base, kind: 'navigate', url: s.page.url };
       case 'reload': return { ...base, kind: 'navigate', url: s.navigation?.toUrl ?? s.page.url, reload: true, note: RELOAD_AS_GET_NOTE };
       case 'navigation': case 'spa-navigation': {
-        const url = s.navigation?.toUrl ?? s.page.url;
-        if (prev && OPERATION_KINDS.has(prev.kind)) return { ...base, kind: 'wait', wait: r.wait ?? { kind: 'url-matches', value: urlContainsValue(url) } };
+        const url = navUrl(s);
+        // 直前までさかのぼった遷移の連鎖の起点（遷移でない最初の手順）
+        let k = index - 1;
+        while (k >= 0 && isNav(list[k])) k--;
+        const root = k >= 0 ? list[k] : undefined;
+        if (root && OPERATION_KINDS.has(root.kind)) {
+          // この遷移以降、遷移でない手順までの後続の遷移先も一致とみなす
+          const later: string[] = [];
+          for (let j = index + 1; j < list.length && isNav(list[j]); j++) later.push(navUrl(list[j]));
+          const chained = index - 1 > k || later.length > 0;
+          return { ...base, kind: 'wait', wait: r.wait ?? chainUrlWait([url, ...later]), ...(chained ? { note: NAV_CHAIN_NOTE } : {}) };
+        }
         if (s.kind === 'spa-navigation' && prev) return { ...base, kind: 'wait', wait: r.wait ?? { kind: 'url-matches', value: urlContainsValue(url) } };
         return { ...base, kind: 'navigate', url };
       }
@@ -274,7 +305,42 @@ export interface ReplayStepResult {
   acted?: ActedState;
   /** (追加) 停止の要求を受けたときに実行中だった手順（ok にも未実行にもしない。reason に理由がある） */
   stoppedWhileRunning?: boolean;
+  /** (追加) 調査用の診断ログ（フレーム・セレクター・文書の切り替わりの観測）。入力値は含めない */
+  diag?: ReplayDiagnostics;
 }
+
+/** 試したセレクターと再生時点の一致件数 */
+export interface ReplaySelectorAttempt { language: 'css' | 'xpath'; selector: string; source: 'human' | 'recorded'; count: number | null; error?: string }
+
+/** 再生スクリプトを注入できたフレーム（トップからの経路。index はフレーム一覧での位置、selector は親文書での iframe 要素） */
+export interface ReplayFrameSeen { frameId: number; documentId?: string; path: { index: number; selector?: string }[]; url: string; readyState?: string; iframeCount?: number }
+
+/** 対象要素が見つからなかったときに、ほかのフレームで同じセレクターを探した結果（診断のみ。そのフレームで操作はしない） */
+export interface ReplayFrameProbe { frameId: number; path: { index: number; selector?: string }[]; url: string; counts: { selector: string; count: number | null }[] }
+
+/**
+ * 1 手順の再生の診断ログ（調査用）。
+ * 入力値・機密欄の値は含めない。URL は記録・出力と同じく置換ルールの対象。
+ */
+export interface ReplayDiagnostics {
+  /** 時刻つきの出来事（注入、フレームの解決、文書の切り替わりなど） */
+  log: { at: ISO; text: string; /** 同じ出来事が続いた回数（2 以上のときだけ） */ repeat?: number; lastAt?: ISO }[];
+  /** 記録時のフレーム経路 */
+  recordedFrame?: { path: FrameHop[]; url: string };
+  /** 最後に観測したフレームの一覧 */
+  frames?: ReplayFrameSeen[];
+  /** 選んだフレーム */
+  frameId?: number;
+  /** ページ内で試したセレクター（最後の試行） */
+  attempts?: ReplaySelectorAttempt[];
+  /** 対象要素が見つからなかった場合の、ほかのフレームでの一致件数 */
+  probe?: ReplayFrameProbe[];
+  /** 打ち切った件数（ログが長くなりすぎないよう上限を設けている） */
+  truncated?: number;
+}
+
+export const DIAG_LOG_MAX = 80;
+export const DIAG_FRAMES_MAX = 40;
 
 /** 操作を実行したか（再試行で二重操作になり得るか） */
 export type ActedState = 'yes' | 'possibly' | 'no';
