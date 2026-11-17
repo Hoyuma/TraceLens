@@ -105,8 +105,8 @@ function fire(el: Element, type: string, init: EventInit & Record<string, unknow
   return el.dispatchEvent(new C(type, { bubbles: true, cancelable: true, composed: true, ...init }));
 }
 
-/** ポインター・マウスのイベント列を送り、click() する。 */
-export function clickElement(el: Element): void {
+/** クリックの前段（ポインター・マウスのイベント列）を送り、クリックの座標を返す */
+function pressSequence(el: Element): { clientX: number; clientY: number; button: number } {
   try { (el as HTMLElement).scrollIntoView?.({ block: 'center', inline: 'center' }); } catch { /* ignore */ }
   const r = el.getBoundingClientRect();
   const pos = { clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0 };
@@ -115,9 +115,27 @@ export function clickElement(el: Element): void {
   try { (el as HTMLElement).focus?.({ preventScroll: true }); } catch { /* ignore */ }
   fire(el, 'pointerup', { ...pos, pointerType: 'mouse', isPrimary: true }, 'PointerEvent');
   fire(el, 'mouseup', pos, 'MouseEvent');
+  return pos;
+}
+
+/** ポインター・マウスのイベント列を送り、click() する。 */
+export function clickElement(el: Element): void {
+  const pos = pressSequence(el);
   if (typeof (el as HTMLElement).click === 'function') (el as HTMLElement).click();
   else fire(el, 'click', { ...pos, detail: 1 }, 'MouseEvent');
 }
+
+/**
+ * クリックで javascript: URL へのリンクをたどるか（要素自身か祖先の a / area の href が javascript:）。
+ * 拡張の isolated world から click() すると、javascript: URL は拡張側の CSP で判定されてブロックされる
+ * （実在の業務サイトで確認: "Running the JavaScript URL violates the following Content Security Policy directive 'script-src 'self' … chrome-extension://…"）。
+ */
+export function javascriptUrlLink(el: Element): boolean {
+  const a = el.closest?.('a[href], area[href]');
+  return !!a && /^\s*javascript:/i.test(a.getAttribute('href') ?? '');
+}
+
+export { MAIN_CLICK_ATTR } from '../shared/messages';
 
 /**
  * ネイティブの value setter で値を設定し、input / change を送る。
@@ -288,6 +306,19 @@ export interface ExecEnv extends WaitEnv {
   beforeAct?: (info: { selector?: ReplaySelector }) => Promise<boolean>;
   sleep?: (ms: number) => Promise<void>;
   quietMaxMs?: number;
+  /** javascript: URL のリンクを、ページ側（main world）でクリックする（SW に依頼する）。未指定ならページ側では実行できない */
+  mainWorldClick?: (el: Element) => Promise<{ ok: boolean; reason?: string }>;
+}
+
+/** CSP の違反のうち、再生スクリプト（拡張）由来のもの（ページ自身の違反は数えない） */
+function watchExtensionCsp(doc: Document): { stop(): string | null } {
+  let hit: string | null = null;
+  const on = (e: Event) => {
+    const v = e as SecurityPolicyViolationEvent;
+    if (/^chrome-extension:|^moz-extension:/i.test(v.sourceFile ?? '')) hit = `${v.effectiveDirective || v.violatedDirective}${v.blockedURI ? `、ブロック対象: ${v.blockedURI}` : ''}`;
+  };
+  try { doc.addEventListener('securitypolicyviolation', on, true); } catch { /* ignore */ }
+  return { stop() { try { doc.removeEventListener('securitypolicyviolation', on, true); } catch { /* ignore */ } return hit; } };
 }
 
 const OPERATIONS = new Set(['click', 'input', 'select', 'check', 'key']);
@@ -367,9 +398,19 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
   if (env.beforeAct && !(await env.beforeAct({ selector: used }))) return { status: 'failed', reason: '再生の制御側で取り消されたため操作していない' };
 
   let note = '';
+  const csp = watchExtensionCsp(env.doc);
   try {
     switch (a.kind) {
-      case 'click': clickElement(el); break;
+      case 'click':
+        if (javascriptUrlLink(el)) {
+          // javascript: URL は拡張側から実行するとブロックされるため、ページ側（main world）でクリックする
+          pressSequence(el);
+          if (!env.mainWorldClick) { csp.stop(); return { status: 'failed', reason: 'javascript: URL のリンクは、ページ側でのクリックが使えないため実行できない', selectorUsed: sel(used), matchCount: 1, ...diagOf() }; }
+          const m = await env.mainWorldClick(el);
+          if (!m.ok) { csp.stop(); return { status: 'failed', reason: `javascript: URL のリンクを、ページ側でクリックできなかった: ${m.reason ?? '理由不明'}（クリックの前段のイベントは送った）`, selectorUsed: sel(used), matchCount: 1, ...diagOf() }; }
+          note = 'javascript: URL のリンクのため、ページ側（main world）でクリックした';
+        } else clickElement(el);
+        break;
       case 'input':
         if (isTextInput(el)) setNativeValue(el, a.text!);
         else { setEditableText(el as HTMLElement, a.text!); note = 'contenteditable は中身のテキストを置き換えた（リッチエディタ独自の内部状態には反映されない可能性がある）'; }
@@ -390,10 +431,16 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
       }
     }
   } catch (e) {
+    csp.stop();
     return { status: 'failed', reason: `操作中に例外が発生した: ${(e as Error)?.name ?? 'Error'}`, selectorUsed: sel(used), matchCount: used ? 1 : undefined };
   }
   const d = diagOf(); // 操作の直後（遷移の前）に文書の情報を控える
   const wo = await waitFor(a.wait, env, Math.max(deadline, now() + MIN_WAIT_AFTER_ACTION_MS), env.quietMaxMs);
+  const blocked = csp.stop();
+  if (blocked) {
+    // 再生スクリプトの処理がページの CSP でブロックされた: 操作が効いていない可能性があるため、待機条件を観測できても ok にしない
+    return { status: 'failed', reason: `操作の一部がコンテンツ セキュリティ ポリシー（CSP）でブロックされた（${blocked}）。操作が効いていない可能性がある`, waitOutcome: wo, selectorUsed: sel(used), matchCount: used ? 1 : undefined, ...d };
+  }
   const rep = { ...waitReply(wo, true), ...d };
   if (used) { rep.selectorUsed = sel(used); rep.matchCount = 1; }
   if (note && rep.status === 'ok') rep.reason = note;

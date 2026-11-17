@@ -704,6 +704,8 @@ try {
   const donePage = findPage(/flow-done\.html/, [fl]);
   const doneType = donePage ? await donePage.locator('#done-type').textContent() : null;
   check('P19', '連鎖遷移の途中の URL を直接開かず、遷移の観測で待つ（遷移の手順はすべて ok、不正な画面遷移にならない）', rF?.ok && navRes.length >= 2 && navRes.every((x) => x?.status === 'ok' && x.acted !== 'yes'),JSON.stringify(navRes.map((x) => [x?.status, x?.reason ?? '', x?.waitOutcome?.status])));
+  const jsClick = fsteps.find((x) => x.kind === 'click' && x.target?.id === 'open-apply');
+  check('P22', 'javascript: URL のリンクは、ページ側（main world）でクリックして実行され、拡張側の CSP でブロックされない（その後の遷移が起きる）', !!jsClick && fres(jsClick.id)?.status === 'ok' && /main world/.test(`${fres(jsClick.id)?.reason ?? ''} ${fres(jsClick.id)?.detail ?? ''}`) && navRes.every((x) => x?.status === 'ok'), JSON.stringify(jsClick && fres(jsClick.id)));
   check('P20', '入れ子の iframe 内の入力・決定を、iframe の index がずれた画面でも記録時のフレームで再生し、最後まで実行する', !!nameStep && frun.status === 'completed' && fres(nameStep.id)?.status === 'ok' && doneType === '振替伝票依頼', JSON.stringify({ status: frun.status, reason: frun.reason, name: nameStep && fres(nameStep.id), doneType, results: frun.results.map((x) => [x.status, (x.reason ?? '').slice(0, 160)]) }));
   check('P21', 'フレーム内の手順の診断ログに、選んだフレームと照合方法が残る', !!nameStep && fres(nameStep.id)?.diag?.frameId > 0 && fres(nameStep.id).diag.log.some((l) => /フレームを特定/.test(l.text)), JSON.stringify(nameStep && fres(nameStep.id)?.diag?.log || null).slice(0, 600));
   await fl.evaluate(() => localStorage.removeItem('mock.extraFrame')).catch(() => {});

@@ -1,9 +1,9 @@
 // TraceLens 再生スクリプト（再生対象タブの各フレームに、Service Worker から都度注入される。マニフェストには登録しない）
 // - 記録用スクリプト（window.__tracelensContent）とは別のガードで二重注入を防ぐ
 // - 操作・待機の観測は core.ts。ここは拡張内メッセージの受け口と、再生中の表示だけ
-import type { ReplayActedReply, ReplayPageMsg, ReplayRunReply, ToReplayAuxMsg, ToReplayMsg } from '../shared/messages';
+import type { ReplayActedReply, ReplayMainClickReply, ReplayPageMsg, ReplayRunReply, ToReplayAuxMsg, ToReplayMsg } from '../shared/messages';
 import { cssPath } from '../shared/selectors';
-import { executeAction, waitFor, waitReply, OVERLAY_TAG, type FrameDescription } from './core';
+import { executeAction, waitFor, waitReply, MAIN_CLICK_ATTR, OVERLAY_TAG, type FrameDescription } from './core';
 
 declare global { interface Window { __tracelensReplay?: { version: number; describe(): FrameDescription } } }
 
@@ -61,6 +61,19 @@ declare global { interface Window { __tracelensReplay?: { version: number; descr
             const r = (await chrome.runtime.sendMessage({ t: 'replay:acted', runId, stepId: action.stepId, attemptId } satisfies ReplayPageMsg)) as ReplayActedReply | undefined;
             return !!r?.proceed;
           } catch { return false; }
+        },
+        mainWorldClick: async (el) => {
+          // 印を付けて SW に依頼し、SW が world: 'MAIN' でその要素を click() する（javascript: URL を拡張側の CSP で止めないため）
+          const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+          try {
+            el.setAttribute(MAIN_CLICK_ATTR, token);
+            const r = (await chrome.runtime.sendMessage({ t: 'replay:main-click', runId, stepId: action.stepId, attemptId, token } satisfies ReplayPageMsg)) as ReplayMainClickReply | undefined;
+            return r ?? { ok: false, reason: 'Service Worker から応答がない' };
+          } catch (e) {
+            return { ok: false, reason: String((e as Error)?.message || e) };
+          } finally {
+            try { if (el.getAttribute(MAIN_CLICK_ATTR) === token) el.removeAttribute(MAIN_CLICK_ATTR); } catch { /* ignore */ }
+          }
         },
       }).then((r: ReplayRunReply) => sendResponse(r), (e) => sendResponse({ status: 'failed', reason: `再生スクリプトの例外: ${(e as Error)?.name ?? 'Error'}` } satisfies ReplayRunReply));
       return true;
