@@ -206,11 +206,32 @@ describe('フレームの解決', () => {
     { frameId: 7, path: [{ index: 1, selector: 'html > body > iframe:nth-of-type(2)' }] },
   ];
   it('トップは frameId 0、子フレームは経路の index で照合する', () => {
-    expect(matchFrame(frames, [])).toEqual({ frameId: 0 });
-    expect(matchFrame(frames, [{ index: 1, crossOrigin: false }])).toEqual({ frameId: 7 });
+    expect(matchFrame(frames, [])).toMatchObject({ frameId: 0 });
+    expect(matchFrame(frames, [{ index: 1, crossOrigin: false }])).toMatchObject({ frameId: 7 });
   });
   it('index が取れなかった階層は selector で照合し、一致しなければ理由を返す', () => {
-    expect(matchFrame(frames, [{ index: -1, selector: 'html > body > main > iframe', crossOrigin: false }])).toEqual({ frameId: 5 });
+    expect(matchFrame(frames, [{ index: -1, selector: 'html > body > main > iframe', crossOrigin: false }])).toMatchObject({ frameId: 5 });
     expect('error' in matchFrame(frames, [{ index: 3, crossOrigin: true }, { index: 0, crossOrigin: true }])).toBe(true);
+  });
+  it('iframe の追加で index がずれても、selector と URL で記録時のフレームを選ぶ（index だけで別のフレームを選ばない）', () => {
+    // 記録時: ダイアログの iframe は index 0。再生時: 先に隠し iframe（アップロード用など）が追加され、ダイアログは index 1 になった
+    const live = [
+      { frameId: 0, path: [] },
+      { frameId: 11, path: [{ index: 0, selector: 'html > body > iframe', url: 'https://example.test/upload' }] },
+      { frameId: 12, path: [{ index: 1, selector: '#GB_window > div:nth-of-type(2) > iframe', url: 'https://example.test/loader.html' }] },
+    ];
+    const rec = [{ index: 0, selector: '#GB_window > div:nth-of-type(2) > iframe', crossOrigin: false, url: 'https://example.test/loader.html?s=0' }];
+    expect(matchFrame(live, rec)).toMatchObject({ frameId: 12, via: 'selector' });
+  });
+  it('selector も index も複数一致する入れ子では、各階層の URL（origin + path）で絞る', () => {
+    const live = [
+      { frameId: 0, path: [] },
+      { frameId: 21, path: [{ index: 0, selector: 'html > body > iframe', url: 'https://example.test/a' }, { index: 0, selector: 'html > body > iframe', url: 'https://example.test/a/inner' }] },
+      { frameId: 22, path: [{ index: 0, selector: 'html > body > iframe', url: 'https://example.test/b' }, { index: 0, selector: 'html > body > iframe', url: 'https://example.test/b/inner?token=2' }] },
+    ];
+    const rec = [{ index: 0, selector: 'html > body > iframe', crossOrigin: false, url: 'https://example.test/b' }, { index: 0, selector: 'html > body > iframe', crossOrigin: false, url: 'https://example.test/b/inner?token=1' }];
+    expect(matchFrame(live, rec)).toMatchObject({ frameId: 22 });
+    // URL でも絞れなければ特定できない理由を返す
+    expect(matchFrame(live, rec.map((h) => ({ ...h, url: undefined })))).toEqual({ error: expect.stringContaining('2 件') });
   });
 });

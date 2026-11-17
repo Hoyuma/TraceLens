@@ -19,12 +19,15 @@ declare global { interface Window { __tracelensReplay?: { version: number; descr
       const parent = w.parent;
       let index = -1;
       try { for (let i = 0; i < parent.frames.length; i++) if (parent.frames[i] === w) { index = i; break; } } catch { /* ignore */ }
-      const hop: { index: number; selector?: string } = { index };
+      const hop: { index: number; selector?: string; url?: string } = { index };
       try { const fe = w.frameElement; if (fe) hop.selector = cssPath(fe).selector; } catch { /* cross-origin */ }
+      try { hop.url = w.location.href; } catch { /* cross-origin */ }
       path.unshift(hop);
       w = parent;
     }
-    return { isTop, path, url: location.href };
+    let iframeCount: number | undefined;
+    try { iframeCount = document.querySelectorAll('iframe,frame').length; } catch { /* ignore */ }
+    return { isTop, path, url: location.href, readyState: document.readyState, iframeCount };
   }
   window.__tracelensReplay = { version: 1, describe };
 
@@ -63,7 +66,7 @@ declare global { interface Window { __tracelensReplay?: { version: number; descr
       return true;
     }
     if (msg.t === 'replay:wait') {
-      void waitFor(msg.wait, env, Date.now() + msg.timeoutMs).then((wo) => sendResponse(waitReply(wo, false)));
+      void waitFor(msg.wait, env, Date.now() + msg.timeoutMs).then((wo) => sendResponse({ ...waitReply(wo, false), href: location.href } satisfies ReplayRunReply));
       return true;
     }
     if (msg.t === 'replay:overlay') {

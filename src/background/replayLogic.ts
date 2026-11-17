@@ -4,7 +4,7 @@
 // - 停止の確定（実行中の手順を成功にも未実行にも見せない）
 // - replay:run の応答の扱い（受け取れた失敗理由を優先する）
 // - 同一文書内の移動（# だけが違う URL）と、記録した再読み込みの再生先
-import type { ActedState, ReplayAction, ReplayStepResult } from '../shared/replay';
+import { DIAG_FRAMES_MAX, DIAG_LOG_MAX, type ActedState, type ReplayAction, type ReplayDiagnostics, type ReplayFrameSeen, type ReplayStepResult } from '../shared/replay';
 import type { ActiveReplay, ReplayRunReply } from '../shared/messages';
 
 // ---- 注入エラー ---------------------------------------------------------------
@@ -89,6 +89,50 @@ export function decideRunReply(i: { reply: ReplayRunReply | undefined | 'timeout
   const lastReason = reply?.reason ?? i.lastReason;
   if (i.pastDeadline) return { kind: 'fail', reason: lastReason ?? (i.failedSend ? 'ページとの接続が切れ、操作できなかった' : 'ページから結果を受け取れなかった'), acted: 'no' };
   return { kind: 'retry', lastReason };
+}
+
+// ---- 文書の切り替わり ----------------------------------------------------------------
+/** 文書の識別子（executeScript の結果の documentId。Chrome 106 以降）。top: トップフレーム、target: 対象フレーム */
+export interface DocIds { top?: string; target?: string }
+
+/**
+ * 操作・観測の前後で文書が切り替わったか。
+ * タブの読み込み状態（tabs.onUpdated の loading）は、フレーム内の読み込みでも変わりうる（API の文書には条件が書かれていない）。
+ * そのため、トップと対象フレームの documentId を比べて判断する。documentId を取れなかった場合だけ、タブの読み込み状態で判断する。
+ * - after が 'unreachable': 対象フレームに到達できない（フレームが外れた・文書を破棄した）。切り替わったとみなす
+ * - after が 'unknown': 問い合わせに応答がない（ダイアログの表示中など）。タブの読み込み状態で判断する
+ */
+export function documentChanged(before: DocIds, after: DocIds | 'unreachable' | 'unknown', epochChanged: boolean): { changed: boolean; basis: 'document-id' | 'unreachable' | 'tab-status' } {
+  if (after === 'unreachable') return { changed: true, basis: 'unreachable' };
+  if (after === 'unknown' || !before.top || !after.top) return { changed: epochChanged, basis: 'tab-status' };
+  const changed = after.top !== before.top || (!!before.target && after.target !== before.target);
+  return { changed, basis: 'document-id' };
+}
+
+// ---- 診断ログ -------------------------------------------------------------------
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** 1 手順の診断ログを集める。同じ文が続く場合は回数だけ数える（再試行のループでログが埋まらないように） */
+export class DiagLog {
+  private d: ReplayDiagnostics = { log: [] };
+  private dropped = 0;
+  constructor(private now: () => string = () => new Date().toISOString()) {}
+  add(text: string): void {
+    const t = clip(text, 600);
+    const last = this.d.log.at(-1);
+    if (last && last.text === t) { last.repeat = (last.repeat ?? 1) + 1; last.lastAt = this.now(); return; }
+    if (this.d.log.length >= DIAG_LOG_MAX) { this.dropped++; return; }
+    this.d.log.push({ at: this.now(), text: t });
+  }
+  frames(list: readonly ReplayFrameSeen[]): void {
+    this.d.frames = list.slice(0, DIAG_FRAMES_MAX).map((f) => ({ ...f, url: clip(f.url, 400), path: f.path.map((h) => ({ index: h.index, ...(h.selector ? { selector: clip(h.selector, 300) } : {}) })) }));
+    if (list.length > DIAG_FRAMES_MAX) this.add(`フレームが ${list.length} 件あり、先頭の ${DIAG_FRAMES_MAX} 件だけを記録した`);
+  }
+  set<K extends Exclude<keyof ReplayDiagnostics, 'log' | 'frames' | 'truncated'>>(k: K, v: ReplayDiagnostics[K]): void { this.d[k] = v; }
+  get empty(): boolean { return !this.d.log.length && !this.d.frames && !this.d.attempts && !this.d.probe; }
+  snapshot(): ReplayDiagnostics {
+    return { ...this.d, log: this.d.log.map((x) => ({ ...x })), ...(this.dropped ? { truncated: this.dropped } : {}) };
+  }
 }
 
 // ---- 移動 ---------------------------------------------------------------------

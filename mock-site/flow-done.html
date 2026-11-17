@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>申請一覧</title><link rel="stylesheet" href="/style.css"></head>
+<body><main class="card"><h1>申請一覧</h1><p id="done-msg">一時保存しました。</p><p>申請種別: <span id="done-type"></span></p>
+<p><a href="/flow-start.html">申請画面へ戻る</a></p></main>
+<script>document.getElementById('done-type').textContent = new URLSearchParams(location.search).get('type') ?? '';</script>
+</body></html>

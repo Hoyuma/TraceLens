@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import {
-  classifyInjectError, decideRunReply, isSameDocumentNavigation, missingOrigin, reloadTarget, stepEntryMode, stopMode, stoppedStepResult,
+  DiagLog, classifyInjectError, decideRunReply, documentChanged, isSameDocumentNavigation, missingOrigin, reloadTarget, stepEntryMode, stopMode, stoppedStepResult,
 } from '../../src/background/replayLogic';
 import { buildReplayPlan, RELOAD_AS_GET_NOTE } from '../../src/shared/replay';
 import { planStepCopy, remapBeforeScreenshot } from '../../src/shared/importScenario';
@@ -154,5 +154,84 @@ describe('取り込みと操作前の画面の参照 (M4)', () => {
   it('未取得の参照は状態と理由だけを残す', () => {
     const r = remapBeforeScreenshot({ status: 'skipped', reasonCode: 'scrolled', reason: 'スクロールした', basis: 'previous-observation' }, { idMap: {}, copyArtifacts: true, srcById: new Map(), stepById: new Map() });
     expect(r).toEqual({ status: 'skipped', reasonCode: 'scrolled', reason: 'スクロールした', basis: 'previous-observation' });
+  });
+});
+
+describe('文書の切り替わり（documentId による判定）', () => {
+  it('トップと対象フレームの documentId が同じなら、タブの読み込み状態が変わっても切り替わりとしない', () => {
+    expect(documentChanged({ top: 'T1', target: 'F1' }, { top: 'T1', target: 'F1' }, true)).toEqual({ changed: false, basis: 'document-id' });
+  });
+  it('トップまたは対象フレームの documentId が変われば切り替わり', () => {
+    expect(documentChanged({ top: 'T1', target: 'F1' }, { top: 'T2', target: 'F1' }, false).changed).toBe(true);
+    expect(documentChanged({ top: 'T1', target: 'F1' }, { top: 'T1', target: 'F2' }, false).changed).toBe(true);
+  });
+  it('対象フレームに到達できなければ切り替わり。応答がない・documentId が取れない場合はタブの読み込み状態で判断する', () => {
+    expect(documentChanged({ top: 'T1' }, 'unreachable', false)).toEqual({ changed: true, basis: 'unreachable' });
+    expect(documentChanged({ top: 'T1' }, 'unknown', false)).toEqual({ changed: false, basis: 'tab-status' });
+    expect(documentChanged({}, { top: 'T1' }, true)).toEqual({ changed: true, basis: 'tab-status' });
+  });
+});
+
+describe('診断ログ', () => {
+  it('同じ出来事が続く場合は回数だけ数え、上限を超えた分は件数だけ残す', () => {
+    let n = 0;
+    const d = new DiagLog(() => `t${n++}`);
+    expect(d.empty).toBe(true);
+    d.add('フレームを特定できない'); d.add('フレームを特定できない'); d.add('フレームを特定できない');
+    d.add('別の出来事');
+    const s = d.snapshot();
+    expect(s.log).toEqual([{ at: 't0', text: 'フレームを特定できない', repeat: 3, lastAt: 't2' }, { at: 't3', text: '別の出来事' }]);
+    for (let i = 0; i < 200; i++) d.add(`e${i}`);
+    expect(d.snapshot().log.length).toBe(80);
+    expect(d.snapshot().truncated).toBe(200 - 78);
+  });
+  it('スナップショットは後の追加の影響を受けない', () => {
+    const d = new DiagLog();
+    d.add('a');
+    const s = d.snapshot();
+    d.add('a');
+    expect(s.log[0].repeat).toBeUndefined();
+  });
+});
+
+const SC = { id: 'scn_1' };
+describe('操作の後に続く遷移の連鎖（リダイレクト・自動送信）', () => {
+  const nav = (seq: number, url: string) => mkStep(seq, { kind: 'navigation', navigation: { toUrl: url }, target: undefined });
+  it('操作の後の連続した遷移はすべて待機にし、途中の URL を直接開かない。途中の遷移は後続の遷移先でも一致とみなす', () => {
+    const steps = [
+      mkStep(1, { kind: 'click' }),
+      nav(2, 'https://example.test/apply/direct/flow_000'),
+      nav(3, 'https://example.test/switch/content'),
+      nav(4, 'https://example.test/view.jssps?im_mark=abc&token=1'),
+      mkStep(5, { kind: 'click' }),
+    ];
+    const plan = buildReplayPlan(SC, steps);
+    expect(plan.map((a) => a.kind)).toEqual(['click', 'wait', 'wait', 'wait', 'click']);
+    expect(plan.some((a) => a.kind === 'navigate')).toBe(false);
+    const w2 = plan[1].wait, w4 = plan[3].wait;
+    expect(w2).toMatchObject({ kind: 'url-matches', isRegex: true });
+    const re = new RegExp(w2.value!);
+    for (const u of ['https://example.test/apply/direct/flow_000', 'https://example.test/switch/content', 'https://example.test/view.jssps?im_mark=zzz&token=9']) expect(re.test(u)).toBe(true);
+    expect(re.test('https://example.test/other')).toBe(false);
+    // 連鎖の最後は自分の URL だけ（クエリのトークンは条件に含めない）
+    expect(w4).toEqual({ kind: 'url-matches', value: 'https://example.test/view.jssps' });
+    expect(plan[1].note).toContain('リダイレクト');
+    expect(plan[3].note).toContain('リダイレクト');
+  });
+  it('正規表現の記号を含む URL はエスケープする', () => {
+    const plan = buildReplayPlan(SC, [mkStep(1, { kind: 'click' }), nav(2, 'https://example.test/forma(2f)view(5f)a.jssps'), nav(3, 'https://example.test/b+c')]);
+    const re = new RegExp(plan[1].wait.value!);
+    expect(re.test('https://example.test/forma(2f)view(5f)a.jssps')).toBe(true);
+    expect(re.test('https://example.test/forma2fview5fa.jssps')).toBe(false);
+  });
+  it('連鎖でない単独の遷移は従来どおり部分一致。操作でない手順に続く遷移は navigate', () => {
+    const plan = buildReplayPlan(SC, [mkStep(1, { kind: 'click' }), nav(2, 'https://example.test/a?x=1'), mkStep(3, { kind: 'wait', origin: 'authored', target: undefined }), nav(4, 'https://example.test/b')]);
+    expect(plan[1].wait).toEqual({ kind: 'url-matches', value: 'https://example.test/a' });
+    expect(plan[1].note).toBeUndefined();
+    expect(plan[3]).toMatchObject({ kind: 'navigate', url: 'https://example.test/b' });
+  });
+  it('人が指定した待機条件は連鎖の既定より優先する', () => {
+    const plan = buildReplayPlan(SC, [mkStep(1, { kind: 'click' }), nav(2, 'https://example.test/a'), { ...nav(3, 'https://example.test/b'), replay: { wait: { kind: 'text-present', value: '申請' } } }]);
+    expect(plan[2].wait).toEqual({ kind: 'text-present', value: '申請' });
   });
 });
