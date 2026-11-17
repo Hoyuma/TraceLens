@@ -1,4 +1,4 @@
-// TraceLens ビルド: (1) ページ+Service Worker (ESM)  (2) コンテンツスクリプト (単一IIFE)
+// TraceLens ビルド: (1) ページ+Service Worker (ESM)  (2) コンテンツスクリプト (単一IIFE)  (3) 再生スクリプト (単一IIFE)
 import { build } from 'vite';
 import react from '@vitejs/plugin-react';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -37,6 +37,21 @@ await build({
     lib: { entry: resolve(root, 'src/content/index.ts'), formats: ['iife'], name: 'TraceLensContent', fileName: () => 'content.js' },
   },
 });
+
+// 再生スクリプト（単一IIFE。再生対象タブにだけ都度注入する。マニフェストには登録しない）
+await build({
+  root, configFile: false, logLevel: 'warn', publicDir: false, esbuild: { charset: 'ascii' },
+  build: {
+    outDir, emptyOutDir: false, target: 'chrome116', minify: false,
+    lib: { entry: resolve(root, 'src/replay/index.ts'), formats: ['iife'], name: 'TraceLensReplay', fileName: () => 'replay.js' },
+  },
+});
+
+// 注入スクリプトに非文字（U+FFFE / U+FFFF など）が入ると Chrome が「UTF-8 でない」として読み込みを拒否するため検査する
+for (const f of ['content.js', 'replay.js']) {
+  const s = readFileSync(resolve(outDir, f), 'utf8');
+  if (/[￾￿﷐-﷯]/.test(s)) throw new Error(`${f} に非文字が含まれている`);
+}
 
 const manifest = JSON.parse(readFileSync(resolve(root, 'manifest.base.json'), 'utf8'));
 if (e2e) {

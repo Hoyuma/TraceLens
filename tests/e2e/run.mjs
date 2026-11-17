@@ -55,6 +55,33 @@ async function dump(extPage) {
 }
 const kinds = (steps) => steps.map((s) => s.kind);
 
+// 日付欄 (input[type=date]) の区切り順はブラウザのロケール・OS に依存する
+// （Linux のヘッドレス Chromium は mm/dd/yyyy、Windows の ja-JP は yyyy/mm/dd だった）。
+// 記録対象ではないタブで順序を調べ、その順で年・月・日を入力する。年は 6 桁まで入るため自動では次へ進まない
+// ので、年の後だけ ArrowRight で次の区切りへ移る（矢印キーは入力欄上では手順として記録されない）。
+let dateOrder = null;
+async function probeDateOrder(context) {
+  const p = await context.newPage();
+  try {
+    await p.setContent('<input type="date" id="d">');
+    await p.focus('#d');
+    await p.keyboard.type('01022003');
+    const v = await p.inputValue('#d');
+    if (v === '2003-01-02') return 'mdy';
+    if (v === '2003-02-01') return 'dmy';
+    return 'ymd';
+  } finally { await p.close(); }
+}
+async function typeDate(page, selector, iso) {
+  const [y, m, d] = iso.split('-');
+  await page.focus(selector);
+  const seq = { mdy: [m, d, y], dmy: [d, m, y], ymd: [y, m, d] }[dateOrder];
+  for (const part of seq) {
+    await page.keyboard.type(part, { delay: 40 });
+    if (part === y && part !== seq.at(-1)) await page.keyboard.press('ArrowRight');
+  }
+}
+
 let diag = async () => {};
 let context = await launch();
 let browserVersion = context.browser()?.version() ?? '';
@@ -64,6 +91,9 @@ try {
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto(`${BASE}/login.html`);
   browserVersion = await page.evaluate(() => navigator.userAgent);
+  dateOrder = await probeDateOrder(context); // 記録開始前に調べる（記録中に別タブを開くと通知の手順が増えるため）
+  console.log('date field order:', dateOrder);
+  await page.bringToFront();
 
   const tabId = await sw.evaluate(async () => (await chrome.tabs.query({})).find((t) => t.url?.includes('login.html')).id);
   const panelP = context.waitForEvent('page');
@@ -113,8 +143,7 @@ try {
 
   // --- 5. 業務操作: 対象日・PJ・工程・工数・IME入力 ---
   const base0 = db.steps.length;
-  await page.focus('#workDate');
-  await page.keyboard.type('11162026', { delay: 40 }); // ヘッドレスChromiumの日付欄は mm/dd/yyyy の順
+  await typeDate(page, '#workDate', '2026-11-16');
   await sleep(900);
   const pj = page.locator('.entry-row select[name="pj"]').first();
   await pj.focus();
@@ -399,9 +428,10 @@ try {
   await review.locator('[data-testid="shot-include"]').click();
   await sleep(400);
   // グループ化
-  review.once('dialog', (d) => d.accept('工数行の入力'));
   await review.click(`[data-step-id="${hoursId}"]`);
   await review.selectOption('[data-testid="group-select"]', '__new');
+  await review.fill('[data-testid="group-inline-name"]', '工数行の入力');
+  await review.click('[data-testid="group-inline-ok"]');
   await sleep(600);
 
   await review.click('[data-testid="btn-export"]');
@@ -439,7 +469,7 @@ try {
   }
   const artifactFiles = names.filter((n) => /\/(screenshots|dom|elements)\//.test(n));
   const orphan = artifactFiles.filter((n) => !stepsJson.steps.some((s) => n.includes(s.id)));
-  check('X02', '画像・DOM・要素・手順がステップIDで対応し、参照切れ・孤立ファイルがない', refOk && orphan.length === 0 && manifest.schemaVersion === 1 && manifest.steps.length === stepsJson.steps.length, JSON.stringify([refProblems, orphan]));
+  check('X02', '画像・DOM・要素・手順がステップIDで対応し、参照切れ・孤立ファイルがない', refOk && orphan.length === 0 && manifest.schemaVersion === 2 && stepsJson.schemaVersion === 2 && manifest.steps.length === stepsJson.steps.length, JSON.stringify([refProblems, orphan, manifest.schemaVersion, stepsJson.schemaVersion, manifest.steps.length, stepsJson.steps.length]));
   const scenarioMd = text('scenario.md');
   check('X03', 'scenario.md に各手順がステップIDつきで載り、未記入・根拠区分が明示される', stepsJson.steps.every((s) => scenarioMd.includes(`\`${s.id}\``)) && scenarioMd.includes('（未記入）') && scenarioMd.includes('[人間が記入した条件] 保存完了メッセージが表示される') && scenarioMd.includes('グループ: 工数行の入力'), '');
   check('X04', 'input-mapping.md に変数・入力元・変換ルールが載る', /工数時間/.test(text('input-mapping.md')) && /タスク記録の集計工数/.test(text('input-mapping.md')) && /未指定（未確認）/.test(text('input-mapping.md')), '');
@@ -488,6 +518,233 @@ try {
 
   writeFileSync(resolve(out, 'export-file-list.txt'), names.sort().join('\n'));
   for (const f of ['scenario.md', 'input-mapping.md', 'README.md', 'implementation-request.md', 'manifest.json']) writeFileSync(resolve(out, `sample-${f}`), text(f));
+
+  // --- 20. 再生 (v2): 記録 → 再生 → 結果の保存 ---
+  // UI は別途実装中のため、拡張ページ（レビュー画面）から Service Worker へ直接メッセージを送って操作する。
+  const send = (m) => review.evaluate((m) => chrome.runtime.sendMessage(m), m);
+  const idbPut = (store, recs) => review.evaluate(async ({ store, recs }) => {
+    const d = await new Promise((res, rej) => { const r = indexedDB.open('tracelens'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    await new Promise((res, rej) => { const tx = d.transaction(store, 'readwrite'); for (const x of recs) tx.objectStore(store).put(x); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+    d.close();
+  }, { store, recs });
+  const replayRuns = (sid) => review.evaluate(async (sid) => {
+    const d = await new Promise((res) => { const r = indexedDB.open('tracelens'); r.onsuccess = () => res(r.result); });
+    const all = await new Promise((res) => { const r = d.transaction('replayRuns').objectStore('replayRuns').getAll(); r.onsuccess = () => res(r.result); });
+    d.close();
+    return all.filter((x) => x.scenarioId === sid).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  }, sid);
+  async function waitReplay(pred, ms = 30000) {
+    const t0 = Date.now(); let last;
+    while (Date.now() - t0 < ms) { last = (await send({ t: 'ui:replay-state' }))?.replay ?? null; if (pred(last)) return last; await sleep(150); }
+    throw new Error(`再生状態の待機が時間切れ: ${JSON.stringify(last && { status: last.status, position: last.position, waitReason: last.waitReason })}`);
+  }
+  const findPage = (re, not = []) => context.pages().find((p) => re.test(p.url()) && !not.includes(p));
+
+  const projectId = db.projects[0].id;
+  const scId = 'scn_e2ereplay';
+  const nowIso = new Date().toISOString();
+  await idbPut('scenarios', [{ schemaVersion: 2, id: scId, projectId, name: '再生の検証', purpose: '', preconditions: '', expectedResult: '', openQuestions: '', createdAt: nowIso, updatedAt: nowIso, sessions: [], groups: [], replacementRules: [], variables: [{ id: 'var_e2e1', name: '社員番号', defaultValue: 'E00000' }] }]);
+  const rec = await context.newPage();
+  await rec.goto(`${BASE}/login.html`);
+  const recTabId = await sw.evaluate(async () => (await chrome.tabs.query({})).find((t) => t.url?.includes('login.html')).id);
+  const startRec = await send({ t: 'ui:start', scenarioId: scId, tabId: recTabId });
+  check('P00', '再生の検証用シナリオの記録を開始できる', startRec?.ok, JSON.stringify(startRec));
+  await sleep(1500);
+  await rec.bringToFront();
+  await rec.click('#userId'); await rec.keyboard.type('E12345', { delay: 20 });
+  await rec.click('#password'); await rec.keyboard.type(PASSWORD, { delay: 15 });
+  await sleep(300);
+  await rec.click('#login');
+  await rec.waitForURL(/index\.html/);
+  await sleep(1800);
+  await typeDate(rec, '#workDate', '2026-11-20');
+  await sleep(900);
+  await rec.locator('.entry-row select[name="pj"]').first().focus();
+  await rec.keyboard.press('ArrowDown'); await rec.keyboard.press('ArrowDown');
+  await sleep(1500);
+  await rec.locator('.entry-row select[name="step"]').first().focus();
+  await rec.keyboard.press('ArrowDown');
+  await sleep(700);
+  await rec.locator('.entry-row input[name="hours"]').first().click(); await rec.keyboard.type('2.5', { delay: 30 });
+  await rec.locator('.entry-row input[name="memo"]').first().click(); await rec.keyboard.type('replay-memo', { delay: 20 });
+  await sleep(300);
+  await rec.click('#save');
+  await rec.waitForFunction(() => document.querySelector('#status').textContent.startsWith('保存しました'));
+  await sleep(1500);
+  await send({ t: 'ui:stop' });
+  await sleep(800);
+  db = await dump(review);
+  const rsteps = db.steps.filter((s) => s.scenarioId === scId);
+  const userStep = rsteps.find((s) => s.kind === 'input' && s.target?.id === 'userId');
+  const pwStepR = rsteps.find((s) => s.kind === 'input' && s.target?.id === 'password');
+  const saveStepR = rsteps.find((s) => s.kind === 'click' && s.target?.id === 'save');
+  const dateStepR = rsteps.find((s) => s.kind === 'input' && s.target?.id === 'workDate');
+  const hoursStepR = rsteps.find((s) => s.kind === 'input' && s.target?.name === 'hours');
+  check('P01', '再生用の記録ができている（ログイン・業務操作・保存）', !!userStep && !!pwStepR && !!saveStepR && !!dateStepR && !!hoursStepR, kinds(rsteps).join(','));
+  // 変数と待機条件の指定（レビュー画面の編集の代わりに直接保存）
+  await idbPut('steps', [
+    { ...userStep, replay: { valueTemplate: '{{社員番号}}' } },
+    { ...saveStepR, replay: { wait: { kind: 'text-present', value: '保存しました' } } },
+    { ...hoursStepR, replay: { timeoutMs: 1500 } },
+  ]);
+
+  // (1) 通し再生（新しいタブ）: 変数の入力、パスワード欄で manual の一時停止、最後まで実行
+  const r1 = await send({ t: 'ui:replay-start', scenarioId: scId, mode: 'all', variableValues: { 社員番号: 'E99999' } });
+  check('P02', '再生を開始できる（タブ省略時は計画の最初の URL で新しいタブを開く）', r1?.ok && !!r1.replay && r1.replay.tabId !== recTabId, JSON.stringify({ ok: r1?.ok, code: r1?.code, message: r1?.message }));
+  const recBusy = await send({ t: 'ui:start', scenarioId: scId, tabId: recTabId });
+  check('P03', '再生中は記録を開始できない（code: replay-active）', recBusy?.ok === false && recBusy.code === 'replay-active', JSON.stringify(recBusy));
+  const m1 = await waitReplay((r) => r?.waitReason?.code === 'manual-step');
+  const rp = findPage(/login\.html/, [rec]);
+  const uidVal = await rp.inputValue('#userId');
+  const pwVal = await rp.inputValue('#password');
+  check('P04', '変数の値が入力され、パスワード欄には値を書き込まず manual で一時停止する', uidVal === 'E99999' && pwVal === '' && m1.waitReason.stepId === pwStepR.id, JSON.stringify({ uidVal, pwLen: pwVal.length, wait: m1.waitReason }));
+  await rp.fill('#password', PASSWORD);
+  const cm = await send({ t: 'ui:replay-continue-manual', stepId: pwStepR.id });
+  await waitReplay((r) => r === null, 60000);
+  let runs = await replayRuns(scId);
+  const run1 = runs.at(-1);
+  const res = (id) => run1.results.find((x) => x.stepId === id);
+  const saved = await findPage(/index\.html/, [rec]).locator('#status').textContent();
+  check('P05', '最後まで再生され、結果が保存される（操作は ok、パスワードは manual、記録終了は skipped）', cm?.ok && run1.status === 'completed' && res(userStep.id).status === 'ok' && res(pwStepR.id).status === 'manual' && res(saveStepR.id).status === 'ok' && run1.results.every((x) => ['ok', 'manual', 'skipped'].includes(x.status)) && run1.results.filter((x) => x.status === 'skipped').every((x) => !!x.reason), JSON.stringify(run1.results.map((x) => [x.status, x.reason ?? ''])));
+  check('P06', '保存クリックの待機条件（文字列の表示）が観測され、ページに保存完了が表示される', res(saveStepR.id).waitOutcome?.kind === 'text-present' && res(saveStepR.id).waitOutcome?.status === 'observed' && /^保存しました/.test(saved), JSON.stringify([res(saveStepR.id).waitOutcome, saved]));
+  check('P07', 'セレクターの使用と一致件数（再生時点）が結果に残る', res(userStep.id).matchCount === 1 && !!res(userStep.id).selectorUsed?.selector, JSON.stringify(res(userStep.id)));
+  const runsRaw = JSON.stringify(runs) + JSON.stringify(await sw.evaluate(() => chrome.storage.session.get(null)));
+  check('P08', 'パスワードは再生結果・状態のどこにも保存されない。変数の値（secret でないもの）は記録される', !runsRaw.includes(PASSWORD) && run1.variableValues['社員番号']?.value === 'E99999', JSON.stringify(run1.variableValues));
+
+  // (2) セレクター不一致: ログイン画面のタブで、工数入力の手順だけを再生する
+  await rec.goto(`${BASE}/login.html`);
+  const r2 = await send({ t: 'ui:replay-start', scenarioId: scId, tabId: recTabId, mode: 'range', onlyStepIds: [hoursStepR.id], variableValues: {} });
+  const f2 = await waitReplay((r) => r?.waitReason?.code === 'failed-step', 20000);
+  check('P09', 'セレクターが一致しない手順は失敗として一時停止し、候補ごとの件数が理由に残る', r2?.ok && f2.waitReason.stepId === hoursStepR.id && /0 件/.test(f2.waitReason.message), f2.waitReason.message);
+  await send({ t: 'ui:replay-stop' });
+  runs = await replayRuns(scId);
+  check('P10', '失敗で止まった再生を停止すると run は failed で確定し、手順の結果は failed と理由を持つ', runs.at(-1).status === 'failed' && runs.at(-1).results[0].status === 'failed' && /0 件/.test(runs.at(-1).results[0].reason), JSON.stringify([runs.at(-1).status, runs.at(-1).results[0]]));
+
+  // (3) 1 手順ずつ
+  const r3 = await send({ t: 'ui:replay-start', scenarioId: scId, mode: 'step', variableValues: { 社員番号: 'E77777' } });
+  const s1 = await waitReplay((r) => r?.status === 'paused' && r.waitReason?.code === 'step-mode');
+  await send({ t: 'ui:replay-step' });
+  const s2 = await waitReplay((r) => r?.status === 'paused' && r.waitReason?.code === 'step-mode' && r.position === 2);
+  const rp3 = context.pages().filter((p) => /login\.html/.test(p.url()) && p !== rec).at(-1);
+  const v3 = await rp3.inputValue('#userId');
+  runs = await replayRuns(scId);
+  check('P11', '1 手順ずつ実行し、毎回一時停止する', r3?.ok && s1.position === 1 && s2.position === 2 && v3 === 'E77777' && runs.at(-1).results[1].status === 'ok' && runs.at(-1).results[2].status === 'pending', JSON.stringify({ p1: s1.position, p2: s2.position, v3 }));
+  await send({ t: 'ui:replay-stop' });
+  runs = await replayRuns(scId);
+  check('P12', '人が停止した再生は stopped で確定する', runs.at(-1).status === 'stopped' && !!runs.at(-1).endedAt, runs.at(-1).status);
+
+  // (4) 範囲の再生・一時停止・再開（業務画面のタブで、対象日の入力から最後まで）
+  const r4a = await send({ t: 'ui:replay-start', scenarioId: scId, mode: 'range', fromStepId: dateStepR.id, variableValues: {} });
+  check('P13', '移動先 URL のない範囲をタブ省略で開始すると、理由つきで開始しない（code: no-start-url）', r4a?.ok === false && r4a.code === 'no-start-url', JSON.stringify(r4a));
+  await rec.goto(`${BASE}/index.html`);
+  await sleep(500);
+  const r4 = await send({ t: 'ui:replay-start', scenarioId: scId, tabId: recTabId, mode: 'range', fromStepId: dateStepR.id, variableValues: {} });
+  await sleep(300);
+  await send({ t: 'ui:replay-pause' });
+  const p4 = await waitReplay((r) => r?.status === 'paused' && r.waitReason?.code === 'paused-by-user');
+  await sleep(1500);
+  const p4b = (await send({ t: 'ui:replay-state' })).replay;
+  check('P14', '一時停止すると、実行中の手順の後で止まり、それ以上進まない', r4?.ok && p4.position === p4b.position && p4.position < p4.plan.length, JSON.stringify({ a: p4.position, b: p4b.position, n: p4.plan.length }));
+  await send({ t: 'ui:replay-resume' });
+  await waitReplay((r) => r === null, 60000);
+  runs = await replayRuns(scId);
+  check('P15', '再開すると最後まで実行される（遅れて現れる選択肢を待って選択する）', runs.at(-1).status === 'completed' && runs.at(-1).results.every((x) => x.status === 'ok' || x.status === 'skipped') && /^保存しました/.test(await rec.locator('#status').textContent()), JSON.stringify(runs.at(-1).results.map((x) => [x.status, x.reason ?? ''])));
+  const recordedAfter = (await dump(review)).steps.filter((s) => s.scenarioId === scId).length;
+  check('P16', '再生で起こした操作は記録に混ざらない（手順数が変わらない）', recordedAfter === rsteps.length, `${rsteps.length} -> ${recordedAfter}`);
+
+  // --- 20. ページ全体・要素単位の画像、操作前の画面の参照、新規タブへの切り替え（追加設定を有効にして記録） ---
+  await review.evaluate(() => chrome.storage.local.set({ 'tracelens.settings': { beforeShot: true, followNewTab: true } }));
+  const capSc = 'scn_e2ecap';
+  await idbPut('scenarios', [{ schemaVersion: 2, id: capSc, projectId, name: '画像取得の検証', purpose: '', preconditions: '', expectedResult: '', openQuestions: '', createdAt: nowIso, updatedAt: nowIso, sessions: [], groups: [], replacementRules: [], variables: [] }]);
+  const cap = await context.newPage();
+  await cap.goto(`${BASE}/long.html`);
+  const capTabId = await sw.evaluate(async () => (await chrome.tabs.query({})).find((t) => t.url?.includes('long.html')).id);
+  await cap.bringToFront();
+  const st0 = await send({ t: 'ui:start', scenarioId: capSc, tabId: capTabId });
+  check('Q00', '追加設定を有効にして記録を開始できる', st0?.ok && st0.session.beforeShot === true && st0.session.followNewTab === true, JSON.stringify(st0?.session && [st0.session.beforeShot, st0.session.followNewTab]));
+  await sleep(2500);
+  const cdb = async () => { const d = await dump(review); return { ...d, steps: d.steps.filter((s) => s.scenarioId === capSc) }; };
+  const imgSize = (artId) => review.evaluate(async (artId) => {
+    const d = await new Promise((res) => { const r = indexedDB.open('tracelens'); r.onsuccess = () => res(r.result); });
+    const a = await new Promise((res) => { const r = d.transaction('artifacts').objectStore('artifacts').get(artId); r.onsuccess = () => res(r.result); });
+    d.close();
+    const b = await createImageBitmap(a.blob); const o = { w: b.width, h: b.height }; b.close(); return o;
+  }, artId);
+
+  // ページ全体
+  const vpH = await cap.evaluate(() => innerHeight);
+  const fp = await send({ t: 'ui:manual-capture', mode: 'full-page' });
+  await sleep(9000);
+  let d2 = await cdb();
+  const fpStep = d2.steps.filter((s) => s.kind === 'manual-capture').at(-1);
+  const fpArt = d2.artifacts.find((a) => a.id === fpStep?.screenshot.artifactId);
+  const fpSize = fpArt ? await imgSize(fpArt.id) : null;
+  check('Q01', 'ページ全体の画像が合成され、枚数・範囲が記録され、スクロール位置が戻る', fp?.ok && fpStep?.screenshot.status === 'captured' && fpArt?.captureInfo?.method === 'full-page' && fpArt.captureInfo.frameCount >= 2 && !!fpSize && fpSize.h > vpH * 1.5 && (await cap.evaluate(() => scrollY)) === 0, JSON.stringify([fpStep?.screenshot, fpArt?.captureInfo?.frameCount, fpSize, vpH]));
+  check('Q02', 'TraceLens が起こしたスクロールはユーザー操作として記録されない（手順は画面保存の 1 件だけ増える）', JSON.stringify(kinds(d2.steps)) === JSON.stringify(['session-start', 'manual-capture']) && fpStep.limitations.some((l) => l.code === 'full-page-composite') && fpArt.captureInfo.notes.length >= 3, kinds(d2.steps).join(','));
+
+  // 要素単位
+  await send({ t: 'ui:picker', on: true, shot: 'element' });
+  await sleep(500);
+  await cap.click('#long-target');
+  await sleep(2500);
+  d2 = await cdb();
+  const elStep = d2.steps.filter((s) => s.kind === 'element-note').at(-1);
+  const elArt = d2.artifacts.find((a) => a.id === elStep?.screenshot.artifactId);
+  const elSize = elArt ? await imgSize(elArt.id) : null;
+  check('Q03', '要素単位の画像が、要素の矩形で切り出されて保存され、切り出し範囲が記録される', elStep?.screenshot.status === 'captured' && elArt?.captureInfo?.method === 'element' && !!elSize && elSize.w === elArt.captureInfo.cropRect.width && elSize.h === elArt.captureInfo.cropRect.height && elSize.w < 600 && elArt.meta.targetRectAtCapture === null, JSON.stringify([elStep?.screenshot, elArt?.captureInfo?.cropRect, elSize]));
+
+  // 操作前の画面の参照
+  await cap.click('#btn-a');
+  await sleep(2500);
+  await cap.click('#btn-b');
+  await sleep(2500);
+  await cap.evaluate(() => scrollTo(0, 30));
+  await sleep(400);
+  await cap.click('#btn-c');
+  await sleep(2500);
+  d2 = await cdb();
+  const ca = d2.steps.find((s) => s.target?.id === 'btn-a'), cb = d2.steps.find((s) => s.target?.id === 'btn-b'), cc = d2.steps.find((s) => s.target?.id === 'btn-c');
+  check('Q04', '直前の観測以降に変化がなければ、直前の画像を「操作前の画面（直前の観測）」として参照する（新しい画像は作らない）', cb?.beforeScreenshot?.status === 'captured' && cb.beforeScreenshot.refStepId === ca?.id && cb.beforeScreenshot.basis === 'previous-observation' && cb.beforeScreenshot.artifactId === ca?.screenshot.artifactId && !d2.artifacts.some((a) => a.id.includes('before')), JSON.stringify([ca?.beforeScreenshot, cb?.beforeScreenshot]));
+  check('Q05', 'スクロールがあった後の操作は、理由つきで参照なし（未取得）になる', cc?.beforeScreenshot?.status === 'skipped' && /scrolled|change-observed/.test(cc.beforeScreenshot.reasonCode) && !!cc.beforeScreenshot.reason && cc.beforeScreenshot.artifactId === undefined, JSON.stringify(cc?.beforeScreenshot));
+  check('Q06', '操作前の参照の時刻は参照先の画像の取得時刻のままで、操作時刻と混ざらない', cb?.beforeScreenshot?.capturedAt === d2.artifacts.find((a) => a.id === cb.beforeScreenshot.artifactId)?.capturedAt && cb.beforeScreenshot.capturedAt !== cb.operationAt, '');
+
+  // 新規タブへの切り替え
+  const newP = context.waitForEvent('page');
+  await cap.click('#open-tab');
+  const np = await newP;
+  await np.waitForLoadState('load');
+  await sleep(2500);
+  let capSess = (await send({ t: 'ui:state' })).session;
+  d2 = await cdb();
+  const swNotices = d2.steps.filter((s) => s.kind === 'notice').map((s) => s.notice.code);
+  check('Q07', '対象タブから開かれたタブへ記録対象が切り替わり、前後に通知の手順が残る', !!capSess && capSess.tabId !== capTabId && capSess.tabStack.length === 1 && swNotices.includes('tab-switch-from') && swNotices.includes('tab-switch-to'), JSON.stringify([capSess?.tabId, capTabId, swNotices]));
+  await np.click('#userId');
+  await np.keyboard.type('E55555', { delay: 20 });
+  await np.keyboard.press('Tab');
+  await sleep(1200);
+  const nOld = (await cdb()).steps.length;
+  await cap.bringToFront();
+  await cap.click('#btn-a');
+  await sleep(800);
+  d2 = await cdb();
+  check('Q08', '切り替え後は新しいタブの操作だけが記録され、元のタブの操作は記録されない（同時に 1 タブ）', d2.steps.some((s) => s.kind === 'input' && s.value?.text === 'E55555') && d2.steps.length === nOld, `${nOld} -> ${d2.steps.length}`);
+  await np.bringToFront();
+  await np.close();
+  await sleep(1500);
+  capSess = (await send({ t: 'ui:state' })).session;
+  d2 = await cdb();
+  check('Q09', '切り替え先のタブを閉じると、元のタブへ戻り、通知が残る', capSess?.tabId === capTabId && d2.steps.some((s) => s.notice?.code === 'tab-switch-back') && (capSess.tabStack ?? []).length === 0, JSON.stringify([capSess?.tabId, d2.steps.filter((s) => s.kind === 'notice').map((s) => s.notice.code)]));
+  await cap.bringToFront();
+  await cap.click('#btn-b');
+  await sleep(1200);
+  d2 = await cdb();
+  check('Q10', '元のタブへ戻った後の操作は記録される', d2.steps.at(-1).kind === 'click' && d2.steps.at(-1).target?.id === 'btn-b', kinds(d2.steps).join(','));
+  await send({ t: 'ui:stop' });
+  await sleep(800);
+  d2 = await cdb();
+  check('Q11', '取得待ちのまま残った成果物がなく、取得失敗は理由つき', d2.steps.every((s) => s.screenshot.status !== 'pending' && (['captured', 'not-applicable'].includes(s.screenshot.status) || !!s.screenshot.reason)), JSON.stringify(d2.steps.filter((s) => s.screenshot.status === 'pending').map((s) => s.seq)));
+  await review.evaluate(() => chrome.storage.local.remove('tracelens.settings'));
+  await cap.close().catch(() => {});
 } catch (e) {
   await diag();
   check('ZZZ', 'E2E スクリプトが最後まで実行される', false, e?.stack ?? String(e));

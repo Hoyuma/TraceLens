@@ -1,9 +1,11 @@
 // 操作対象要素の情報を取得する。
-// 名前(accessible name)は簡易推定の「候補」であり、完全な accname 計算の結果ではない。
+// 名前(accessible name)は「候補」。先頭に accname.ts の計算結果（accname-1.2 準拠の実装による。
+// ブラウザの結果との一致は未検証）を置き、以降は従来の簡易推定の候補を残す。
 import type { ElementInfo, ValueInfo } from './types';
 import { buildSelectorCandidates, cssPath } from './selectors';
 import { serializeDom } from './domSerialize';
 import { isSensitiveField, REDACTED_NOTE } from './sensitive';
+import { ROLE_NOTE, computeAccessibleName, computeRole } from './accname';
 
 const IMPLICIT_ROLE: Record<string, string> = {
   button: 'button', a: 'link', select: 'combobox', textarea: 'textbox', nav: 'navigation', main: 'main',
@@ -44,7 +46,7 @@ export function describeElement(el: Element): ElementInfo {
   }
 
   const labels = labelsOf(el);
-  const names: { source: string; value: string }[] = [];
+  const names: ElementInfo['nameCandidates'] = [];
   const add = (source: string, v: string | null | undefined) => { const t = norm(v); if (t) names.push({ source, value: clip(t, 200) }); };
   const lb = el.getAttribute('aria-labelledby');
   if (lb) add('aria-labelledby', lb.split(/\s+/).map((i) => el.ownerDocument.getElementById(i)?.textContent || '').join(' '));
@@ -57,6 +59,20 @@ export function describeElement(el: Element): ElementInfo {
   if (!isFormField) add('text', text);
   add('title', el.getAttribute('title'));
   add('placeholder', el.getAttribute('placeholder'));
+
+  // accname 準拠の計算結果を先頭の候補に追加する（既存の候補は残す）。機密欄の値は名前に含めない。
+  let computedName: ElementInfo['computedName'];
+  let computedRole: ElementInfo['computedRole'];
+  try {
+    const acc = computeAccessibleName(el);
+    computedName = { value: clip(acc.value, 200), rule: acc.rule, ruleLabel: acc.ruleLabel, note: acc.note };
+    if (acc.value) names.unshift({ source: 'accname', value: clip(acc.value, 200), rule: acc.rule });
+    const cr = computeRole(el);
+    computedRole = { value: cr.value, source: cr.source, note: cr.note ? `${ROLE_NOTE}。${cr.note}` : ROLE_NOTE };
+  } catch {
+    // 計算に失敗しても記録は続ける。失敗は計算値なしとして残す（空の成功にしない）
+    computedName = { value: '', rule: 'failed', ruleLabel: '計算に失敗した', note: '名前の計算中にエラーが発生したため、計算結果はない' };
+  }
 
   const state: Record<string, boolean | string> = {};
   const anyEl = el as HTMLInputElement;
@@ -99,7 +115,7 @@ export function describeElement(el: Element): ElementInfo {
 
   const b = el.getBoundingClientRect();
   const info: ElementInfo = {
-    tag, role, nameCandidates: names,
+    tag, role, nameCandidates: names, computedName, computedRole,
     nameMethodNote: 'TraceLens の簡易推定による候補（aria属性・label・テキスト等の列挙）。完全な Accessible Name 計算の結果ではない',
     labels, state,
     rect: { x: Math.round(b.x), y: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) },

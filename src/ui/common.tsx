@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { EVT_CHANGED, STATE_KEY, type ActiveSession, type UiMsg, type UiReply } from '../shared/messages';
+import { EVT_CHANGED, REPLAY_STATE_KEY, STATE_KEY, type ActiveReplay, type ActiveSession, type ReplayUiMsg, type ReplayUiReply, type UiMsg, type UiReply } from '../shared/messages';
 import { patchStep } from '../shared/db';
 import { newId, type Annotation, type Condition, type Step } from '../shared/types';
 import { fmtTime } from '../shared/describe';
+import { LANGS, setLang, t, useI18n, type Lang } from './i18n';
 
 export function sendUi(msg: UiMsg): Promise<UiReply> {
   return chrome.runtime.sendMessage(msg).catch((e) => ({ ok: false, message: String(e) }));
@@ -31,11 +32,89 @@ export function useSession(): ActiveSession | null {
   return s;
 }
 
-export function Brand() {
-  return <div className="brand"><b>TraceLens</b><small>操作と意図を、実装につなぐ</small></div>;
+/** 進行中の再生（chrome.storage.session）。useSession と同じ方式で購読する。 */
+export function useReplay(): ActiveReplay | null {
+  const [s, setS] = useState<ActiveReplay | null>(null);
+  useEffect(() => {
+    chrome.storage.session.get(REPLAY_STATE_KEY).then((v) => setS((v[REPLAY_STATE_KEY] as ActiveReplay) ?? null)).catch(() => setS(null));
+    const h = (ch: Record<string, chrome.storage.StorageChange>, area: string) => { if (area === 'session' && REPLAY_STATE_KEY in ch) setS((ch[REPLAY_STATE_KEY].newValue as ActiveReplay) ?? null); };
+    chrome.storage.onChanged.addListener(h);
+    return () => chrome.storage.onChanged.removeListener(h);
+  }, []);
+  return s;
 }
 
-const BASIS: [Condition['basis'], string][] = [['human-stated', '人間が記入'], ['observed', '観測済み'], ['unverified', '未確認']];
+const REPLAY_REPLY_TIMEOUT_MS = 30_000;
+
+/**
+ * 再生エンジン（Service Worker）へ送る。応答が無い・拒否された場合も、理由つきの ok:false を返す
+ * （エンジンが未対応・停止中でも UI を壊さない）。
+ */
+export async function sendReplay(msg: ReplayUiMsg | (Omit<Extract<ReplayUiMsg, { t: 'ui:replay-start' }>, 'tabId'> & { tabId?: number })): Promise<ReplayUiReply> {
+  let timer: number | undefined;
+  try {
+    const timeout = new Promise<ReplayUiReply>((res) => { timer = window.setTimeout(() => res({ ok: false, code: 'timeout', message: t('common.replayTimeout', { s: REPLAY_REPLY_TIMEOUT_MS / 1000 }) }), REPLAY_REPLY_TIMEOUT_MS); });
+    const r = await Promise.race([chrome.runtime.sendMessage(msg) as Promise<ReplayUiReply | undefined>, timeout]);
+    if (!r) return { ok: false, code: 'no-reply', message: t('common.replayNoReply') };
+    if (!r.ok && !r.message) return { ...r, message: t('common.replayFailedCode', { code: r.code ?? t('common.unknown') }) };
+    return r;
+  } catch (e) {
+    return { ok: false, code: 'send-failed', message: t('common.replaySendFailed', { err: String(e) }) };
+  } finally { clearTimeout(timer); }
+}
+
+/** モーダル。Esc で閉じる。 */
+export function Modal({ title, onClose, children, footer, width, testId }: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; width?: number; testId?: string }) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onClose]);
+  return (
+    <div className="modal-bg" data-testid={testId} role="dialog" aria-modal="true" aria-label={title}>
+      <div className="modal" style={width ? { width: `min(${width}px, 94vw)`, height: 'auto', maxHeight: '92vh' } : undefined}>
+        <header><h2 style={{ fontSize: 15 }}>{title}</h2><span style={{ flex: 1 }} /><button onClick={onClose} data-testid="modal-close">{t('common.close')}</button></header>
+        <div className="content">{children}</div>
+        {footer ? <footer>{footer}</footer> : null}
+      </div>
+    </div>
+  );
+}
+
+/** 確認ダイアログ（window.confirm は使わない） */
+export function ConfirmDialog({ title, children, okLabel, danger, busy, onOk, onCancel }: { title: string; children: React.ReactNode; okLabel: string; danger?: boolean; busy?: boolean; onOk: () => void; onCancel: () => void }) {
+  return (
+    <Modal title={title} onClose={onCancel} width={520} testId="confirm-dialog" footer={<>
+      <button data-testid="confirm-cancel" onClick={onCancel}>{t('common.cancel')}</button>
+      <button data-testid="confirm-ok" className={danger ? 'danger' : 'primary'} disabled={busy} onClick={onOk}>{okLabel}</button>
+    </>}>
+      {children}
+    </Modal>
+  );
+}
+
+export function Brand() {
+  useI18n();
+  return <div className="brand"><b>TraceLens</b><small>{t('brand.tagline')}</small></div>;
+}
+
+/**
+ * 表示言語の選択（サイドパネルとレビュー画面のヘッダー）。選んだ言語は chrome.storage.local に保存され、別のページにも反映される。
+ * 出力ZIPと保存済みデータの文言は言語にかかわらず日本語のままなので、英語表示のときはその旨を注記する。
+ */
+export function LangSelect() {
+  const { lang } = useI18n();
+  return (
+    <span className="lang-sel" style={{ display: 'inline-flex', flexDirection: 'column', gap: 2, maxWidth: 240 }}>
+      <select data-testid="lang-select" value={lang} aria-label={t('lang.label')} title={t('lang.label')} style={{ width: 'auto' }} onChange={(e) => void setLang(e.target.value as Lang)}>
+        {LANGS.map((l) => <option key={l} value={l}>{l === 'ja' ? '日本語' : 'English'}</option>)}
+      </select>
+      {lang !== 'ja' && <small className="muted" data-testid="lang-note" style={{ fontSize: 10, lineHeight: 1.3 }}>{t('lang.note')}</small>}
+    </span>
+  );
+}
+
+const BASIS_KEYS = [['human-stated', 'ann.basisHuman'], ['observed', 'ann.basisObserved'], ['unverified', 'ann.basisUnverified']] as const;
 
 function CondList({ type, label, hint, a, update }: { type: Condition['type']; label: string; hint: string; a: Annotation; update: (p: Partial<Annotation>) => void }) {
   const list = a.conditions.filter((c) => c.type === type);
@@ -43,15 +122,15 @@ function CondList({ type, label, hint, a, update }: { type: Condition['type']; l
   return (
     <div className="f" style={{ marginTop: 8 }}>
       <div className="row"><span className="small muted grow">{label}</span>
-        <button className="link small" data-testid={`add-${type}`} onClick={() => update({ conditions: [...a.conditions, { id: newId('cnd'), type, text: '', basis: 'human-stated' }] })}>＋ 追加</button></div>
-      {list.length === 0 && <div className="small muted">未記入（例: {hint}）</div>}
+        <button className="link small" data-testid={`add-${type}`} onClick={() => update({ conditions: [...a.conditions, { id: newId('cnd'), type, text: '', basis: 'human-stated' }] })}>{t('ann.add')}</button></div>
+      {list.length === 0 && <div className="small muted">{t('ann.notEntered', { hint })}</div>}
       {list.map((c) => (
         <div className="cond" key={c.id}>
           <input data-testid={`cond-${type}`} value={c.text} placeholder={hint} onChange={(e) => set(c.id, { text: e.target.value })} />
-          <select value={c.basis} title="この条件の根拠" onChange={(e) => set(c.id, { basis: e.target.value as Condition['basis'], observedAt: e.target.value === 'observed' ? c.observedAt ?? new Date().toISOString() : undefined })}>
-            {BASIS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          <select value={c.basis} title={t('ann.basisTitle')} onChange={(e) => set(c.id, { basis: e.target.value as Condition['basis'], observedAt: e.target.value === 'observed' ? c.observedAt ?? new Date().toISOString() : undefined })}>
+            {BASIS_KEYS.map(([v, l]) => <option key={v} value={v}>{t(l)}</option>)}
           </select>
-          <button title="削除" onClick={() => update({ conditions: a.conditions.filter((x) => x.id !== c.id) })}>×</button>
+          <button title={t('common.delete')} onClick={() => update({ conditions: a.conditions.filter((x) => x.id !== c.id) })}>×</button>
         </div>
       ))}
     </div>
@@ -88,39 +167,39 @@ export function AnnotationEditor({ step, compact, onSaved }: { step: Step; compa
   const liveObs = step.observations.filter((o) => o.type === 'live-region') as Extract<Step['observations'][number], { type: 'live-region' }>[];
   return (
     <div data-testid="annotation-editor">
-      <label className="f"><span>操作の目的</span><input data-testid="f-purpose" value={a.purpose} placeholder="例: 登録する工程を選ぶ" onChange={(e) => update({ purpose: e.target.value })} /></label>
+      <label className="f"><span>{t('ann.purpose')}</span><input data-testid="f-purpose" value={a.purpose} placeholder={t('ann.purposeEx')} onChange={(e) => update({ purpose: e.target.value })} /></label>
       {hasValue || !compact ? (
         <div className="f" style={{ marginTop: 8 }}>
-          <span className="small muted">入力値の扱い{step.value && !step.value.redacted && step.value.text !== undefined ? `（記録時の入力例: 「${step.value.text}」）` : ''}</span>
+          <span className="small muted">{t('ann.valueHandling')}{step.value && !step.value.redacted && step.value.text !== undefined ? t('ann.valueExample', { v: step.value.text }) : ''}</span>
           <div className="row" style={{ marginTop: 2 }}>
-            {([['unspecified', '未指定'], ['fixed', '固定値'], ['variable', '変数']] as const).map(([v, l]) => (
-              <label key={v} className="row" style={{ gap: 3 }}><input type="radio" name={`vk-${step.id}`} data-testid={`vk-${v}`} checked={a.valueKind === v} onChange={() => update({ valueKind: v })} />{l}</label>
+            {([['unspecified', 'ann.vkUnspecified'], ['fixed', 'ann.vkFixed'], ['variable', 'ann.vkVariable']] as const).map(([v, l]) => (
+              <label key={v} className="row" style={{ gap: 3 }}><input type="radio" name={`vk-${step.id}`} data-testid={`vk-${v}`} checked={a.valueKind === v} onChange={() => update({ valueKind: v })} />{t(l)}</label>
             ))}
           </div>
           {a.valueKind === 'variable' && (<>
-            <label className="f"><span>変数名</span><input data-testid="f-variable" value={a.variableName} placeholder="例: 工程コード" onChange={(e) => update({ variableName: e.target.value })} /></label>
-            <label className="f"><span>入力元の項目名</span><input data-testid="f-source" value={a.valueSource} placeholder="例: タスク記録の工程コード" onChange={(e) => update({ valueSource: e.target.value })} /></label>
-            {!compact && <label className="f"><span>変換ルール</span><input data-testid="f-transform" value={a.transformRule} placeholder="例: 分を 0.25 時間単位に丸める" onChange={(e) => update({ transformRule: e.target.value })} /></label>}
+            <label className="f"><span>{t('ann.varName')}</span><input data-testid="f-variable" value={a.variableName} placeholder={t('ann.varNameEx')} onChange={(e) => update({ variableName: e.target.value })} /></label>
+            <label className="f"><span>{t('ann.source')}</span><input data-testid="f-source" value={a.valueSource} placeholder={t('ann.sourceEx')} onChange={(e) => update({ valueSource: e.target.value })} /></label>
+            {!compact && <label className="f"><span>{t('ann.transform')}</span><input data-testid="f-transform" value={a.transformRule} placeholder={t('ann.transformEx')} onChange={(e) => update({ transformRule: e.target.value })} /></label>}
           </>)}
         </div>
       ) : null}
-      {!compact && <CondList type="proceed" label="次へ進む条件" hint="工程の候補が更新され、目的の工程が選べる" a={a} update={update} />}
-      <CondList type="success" label="成功条件" hint="保存完了メッセージが表示される" a={a} update={update} />
+      {!compact && <CondList type="proceed" label={t('ann.proceed')} hint={t('ann.proceedEx')} a={a} update={update} />}
+      <CondList type="success" label={t('ann.success')} hint={t('ann.successEx')} a={a} update={update} />
       {!compact && liveObs.length > 0 && (
-        <div className="note info">観測された通知表示:
+        <div className="note info">{t('ann.liveObserved')}
           {liveObs.map((o, i) => (
-            <div key={i} className="row"><span className="grow">「{o.text}」<span className="muted">（{fmtTime(o.at)}）</span></span>
-              <button className="link small" onClick={() => update({ conditions: [...a.conditions, { id: newId('cnd'), type: 'success', text: `「${o.text}」が表示される`, basis: 'observed', observedAt: o.at }] })}>成功条件に追加</button></div>
+            <div key={i} className="row"><span className="grow">{t('ann.quote', { v: o.text })}<span className="muted">{t('ann.paren', { v: fmtTime(o.at) })}</span></span>
+              <button className="link small" onClick={() => update({ conditions: [...a.conditions, { id: newId('cnd'), type: 'success', text: t('ann.shownText', { v: o.text }), basis: 'observed', observedAt: o.at }] })}>{t('ann.addToSuccess')}</button></div>
           ))}
         </div>
       )}
       <div className="row" style={{ marginTop: 8 }}>
-        <span className="small muted grow">人間による完了確認: {confirmedAt ? fmtTime(confirmedAt) : '未確認'}</span>
-        {confirmedAt ? <button className="link small" onClick={() => confirm(false)}>取消</button> : <button data-testid="confirm-done" onClick={() => confirm(true)}>いま完了を確認</button>}
+        <span className="small muted grow">{t('ann.humanConfirm')} {confirmedAt ? fmtTime(confirmedAt) : t('common.unverified')}</span>
+        {confirmedAt ? <button className="link small" onClick={() => confirm(false)}>{t('common.undo')}</button> : <button data-testid="confirm-done" onClick={() => confirm(true)}>{t('ann.confirmNow')}</button>}
       </div>
-      {!compact && <label className="f"><span>分岐・繰り返しの説明</span><textarea data-testid="f-branching" value={a.branching} placeholder="例: 登録する行数ぶん、行追加〜工数入力を繰り返す" onChange={(e) => update({ branching: e.target.value })} /></label>}
-      <label className="f"><span>補足メモ</span><textarea data-testid="f-note" value={a.note} placeholder="例: PJを選択した後に候補が更新される" onChange={(e) => update({ note: e.target.value })} /></label>
-      {!compact && <label className="f"><span>未確認事項</span><textarea data-testid="f-open" value={a.openQuestions} onChange={(e) => update({ openQuestions: e.target.value })} /></label>}
+      {!compact && <label className="f"><span>{t('ann.branching')}</span><textarea data-testid="f-branching" value={a.branching} placeholder={t('ann.branchingEx')} onChange={(e) => update({ branching: e.target.value })} /></label>}
+      <label className="f"><span>{t('ann.note')}</span><textarea data-testid="f-note" value={a.note} placeholder={t('ann.noteEx')} onChange={(e) => update({ note: e.target.value })} /></label>
+      {!compact && <label className="f"><span>{t('ann.open')}</span><textarea data-testid="f-open" value={a.openQuestions} onChange={(e) => update({ openQuestions: e.target.value })} /></label>}
     </div>
   );
 }
