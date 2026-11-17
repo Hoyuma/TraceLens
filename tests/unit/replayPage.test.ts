@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { applySelect, evaluateWait, executeAction, findTarget, javascriptUrlLink, matchOptions, setNativeValue, waitFor, UNTRUSTED_NOTE } from '../../src/replay/core';
 import { matchFrame } from '../../src/background/replayFrames';
+import { clickMarkedInMainWorld } from '../../src/background/replayLogic';
 import type { ReplaySelector, ResolvedReplayAction } from '../../src/shared/replay';
 
 const css = (selector: string, extra: Partial<ReplaySelector> = {}): ReplaySelector => ({ language: 'css', selector, source: 'recorded', scope: 'document', recordedMatchCount: 1, stability: 'unverified', ...extra });
@@ -109,14 +110,47 @@ describe('1 手順の実行', () => {
     expect(clicked).toBe(0);
   });
 
-  it('クリックはポインター・マウスのイベント列と click を送り、イベントは isTrusted=false', async () => {
+  it('クリックはホバー・ポインター・マウスのイベント列と click を送り、イベントは isTrusted=false', async () => {
     document.body.innerHTML = '<button id="b">b</button>';
     const seen: string[] = []; let trusted: boolean | null = null;
-    for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) document.getElementById('b')!.addEventListener(t, (e) => { seen.push(t); if (t === 'click') trusted = e.isTrusted; });
+    const types = ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    for (const t of types) document.getElementById('b')!.addEventListener(t, (e) => { seen.push(t); if (t === 'click') trusted = e.isTrusted; });
     const r = await executeAction(act('click', { selectors: [css('#b')] }), env());
     expect(r.status).toBe('ok');
-    expect(seen).toEqual(['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']);
+    expect(seen).toEqual(types);
     expect(trusted).toBe(false);
+  });
+
+  describe('座標の要素へのクリック（target が子孫であることを前提にするメニュー）', () => {
+    const orig = (document as any).elementFromPoint;
+    afterEach(() => { (document as any).elementFromPoint = orig; });
+    // jQuery UI 1.8 の autocomplete と同じ判定: mouseover で選択中の項目を決め、click は target が「.ui-menu-item a」の中のときだけ選択する
+    const menu = () => {
+      document.body.innerHTML = '<ul id="m"><li class="ui-menu-item" role="menuitem"><a id="a1">A</a></li><li class="ui-menu-item" role="menuitem"><a id="a2">振替伝票依頼</a></li></ul><p id="out"></p>';
+      let active: Element | null = null;
+      const m = document.getElementById('m')!;
+      m.addEventListener('mouseover', (e) => { const a = (e.target as Element).closest('.ui-menu-item a'); if (a) active = a; });
+      m.addEventListener('click', (e) => { if (!(e.target as Element).closest('.ui-menu-item a') || !active) return; document.getElementById('out')!.textContent = active.textContent; });
+    };
+    it('座標の要素が記録した要素の子孫なら、その要素にホバーとクリックを送る', async () => {
+      menu();
+      (document as any).elementFromPoint = () => document.getElementById('a2');
+      const r = await executeAction(act('click', { selectors: [css('#m > li:nth-of-type(2)')] }), env());
+      expect(r.status).toBe('ok');
+      expect(document.getElementById('out')!.textContent).toBe('振替伝票依頼');
+    });
+    it('座標の要素が記録した要素の外（覆われている）なら、その要素には送らず記録した要素へ送る', async () => {
+      menu();
+      document.body.insertAdjacentHTML('beforeend', '<div id="cover"></div>');
+      let coverClicks = 0;
+      document.getElementById('cover')!.addEventListener('click', () => coverClicks++);
+      let liClicks = 0;
+      document.querySelector('#m > li:nth-of-type(2)')!.addEventListener('click', (e) => { if (e.target === e.currentTarget) liClicks++; });
+      (document as any).elementFromPoint = () => document.getElementById('cover');
+      await executeAction(act('click', { selectors: [css('#m > li:nth-of-type(2)')] }), env());
+      expect(coverClicks).toBe(0);
+      expect(liClicks).toBe(1);
+    });
   });
 
   it('チェックは目標と異なるときだけクリックする', async () => {
@@ -284,5 +318,28 @@ describe('javascript: URL のリンクのクリック', () => {
     expect(r.reason).toContain('CSP');
     const r2 = await executeAction(act('click', { selectors: [css('#c')] }), env());
     expect(r2.status).toBe('ok');
+  });
+});
+
+describe('ページ側（main world）でのクリック', () => {
+  // jsdom には CSS.escape がない（印のトークンは英数字だけなので、そのまま返す代わりで足りる）
+  if (!(globalThis as any).CSS?.escape) (globalThis as any).CSS = { ...(globalThis as any).CSS, escape: (s: string) => s };
+  it('印の要素を click() し、印を外す', () => {
+    document.body.innerHTML = '<a id="a" href="#" data-m="t1">送信</a>';
+    let n = 0; document.getElementById('a')!.addEventListener('click', (e) => { n++; e.preventDefault(); });
+    expect(clickMarkedInMainWorld('data-m', 't1')).toEqual({ ok: true });
+    expect(n).toBe(1);
+    expect(document.getElementById('a')!.hasAttribute('data-m')).toBe(false);
+  });
+  it('click() を持たない要素（リンク内の SVG アイコン）は click イベントを送り、祖先のリンクへ伝わる', () => {
+    document.body.innerHTML = '<a id="a" href="#"><svg><path id="p" data-m="t2"></path></svg></a>';
+    let target: EventTarget | null = null;
+    document.getElementById('a')!.addEventListener('click', (e) => { target = e.target; e.preventDefault(); });
+    expect(clickMarkedInMainWorld('data-m', 't2')).toEqual({ ok: true });
+    expect(target).toBe(document.getElementById('p'));
+  });
+  it('印の要素がなければ理由つきで失敗', () => {
+    document.body.innerHTML = '';
+    expect(clickMarkedInMainWorld('data-m', 'x').ok).toBe(false);
   });
 });
