@@ -192,7 +192,8 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
           )}
           <div className="row" style={{ marginTop: 6, flexWrap: 'wrap' }}>
             {replay.status === 'running' && <button data-testid="replay-pause" disabled={busy} onClick={() => void send({ t: 'ui:replay-pause' })}>{t('sp.pause')}</button>}
-            {replay.status === 'paused' && <button className="primary" data-testid="replay-resume" disabled={busy || wr?.code === 'secret-required' || wr?.code === 'permission'} onClick={() => void send({ t: 'ui:replay-resume' })}>{t('sp.resume')}</button>}
+            {/* 失敗で止まっているときは、汎用の再開を無効にし、確認つきの「再試行」「スキップ」だけを使う（二重操作の防止） */}
+            {replay.status === 'paused' && <button className="primary" data-testid="replay-resume" title={wr?.code === 'failed-step' ? t('rp.resumeFailedTitle') : undefined} disabled={busy || wr?.code === 'secret-required' || wr?.code === 'permission' || wr?.code === 'failed-step'} onClick={() => void send({ t: 'ui:replay-resume' })}>{t('sp.resume')}</button>}
             {replay.status === 'paused' && <button data-testid="replay-step" disabled={busy || wr?.code === 'secret-required' || wr?.code === 'permission' || wr?.code === 'failed-step' || wr?.code === 'manual-step'} onClick={() => void send({ t: 'ui:replay-step' })}>{t('rp.stepOne')}</button>}
             <button className="danger" data-testid="replay-stop" disabled={busy || replay.status === 'stopping'} onClick={() => void send({ t: 'ui:replay-stop' })}>{t('rp.stopBtn')}</button>
           </div>

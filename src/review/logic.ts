@@ -10,7 +10,11 @@ import type { ReplacementRule, Scenario, ScenarioVariable, Step, StepGroup, Step
 
 // ---- 手順のツリー ---------------------------------------------------------------
 
-export interface GroupNode { type: 'group'; group: StepGroup; depth: number; children: TreeNode[]; stepCount: number }
+/**
+ * グループの見出し。グループの手順が連続していないときは、表示・再生順を崩さないよう同じグループを複数の区間に分けて出す。
+ * part は区間の番号（0 が最初）。stepCount はグループ全体（子孫を含む）の手順数。
+ */
+export interface GroupNode { type: 'group'; group: StepGroup; depth: number; children: TreeNode[]; stepCount: number; part: number }
 export interface StepNode { type: 'step'; step: Step; depth: number }
 export type TreeNode = GroupNode | StepNode;
 
@@ -40,40 +44,58 @@ export function containerOf(step: Pick<Step, 'groupId'>, groups: readonly StepGr
 }
 
 /**
- * 表示用のツリー。手順は表示・再生順（order）。グループは、その中（子孫を含む）の最初の手順の位置に置く。
- * 手順を持たないグループは、同じ階層の末尾にグループの order 順で置く。
+ * 表示用のツリー。手順は表示・再生順（orderedSteps。buildReplayPlan と出力と同じ順）のまま並べ、順序を入れ替えない。
+ * グループの手順が連続していない場合は、同じグループの見出しを区間ごとに繰り返す（part で区別）。
+ * 手順を持たないグループは、親の最後の区間（親が無ければ最上位）の末尾にグループの order 順で置く。
  */
 export function buildStepTree(groups: readonly StepGroup[], steps: readonly Step[]): TreeNode[] {
   const ordered = orderedSteps(steps);
   const parents = effectiveParents(groups);
+  const byId = new Map(groups.map((g) => [g.id, g]));
   const gIdx = new Map(groups.map((g, i) => [g.id, i]));
   const kids = new Map<string | null, StepGroup[]>();
   for (const g of groups) { const p = parents.get(g.id) ?? null; kids.set(p, [...(kids.get(p) ?? []), g]); }
-  const stepsBy = new Map<string | null, { s: Step; pos: number }[]>();
-  ordered.forEach((s, pos) => { const c = containerOf(s, groups); stepsBy.set(c, [...(stepsBy.get(c) ?? []), { s, pos }]); });
-
-  const firstPos = new Map<string, number>();
-  const calcFirst = (id: string): number => {
-    let m = Math.min(Infinity, ...(stepsBy.get(id) ?? []).map((x) => x.pos));
-    for (const c of kids.get(id) ?? []) m = Math.min(m, calcFirst(c.id));
-    firstPos.set(id, m);
-    return m;
+  const direct = new Map<string | null, number>();
+  for (const s of ordered) { const c = containerOf(s, groups); direct.set(c, (direct.get(c) ?? 0) + 1); }
+  const countSteps = (id: string): number => (direct.get(id) ?? 0) + (kids.get(id) ?? []).reduce((n, c) => n + countSteps(c.id), 0);
+  const pathOf = (id: string | null): string[] => {
+    const out: string[] = [];
+    for (let cur = id; cur; cur = parents.get(cur) ?? null) out.unshift(cur);
+    return out;
   };
-  for (const g of kids.get(null) ?? []) calcFirst(g.id);
 
-  const countSteps = (id: string): number => (stepsBy.get(id) ?? []).length + (kids.get(id) ?? []).reduce((n, c) => n + countSteps(c.id), 0);
-
-  const build = (container: string | null, depth: number): TreeNode[] => {
-    const items: { key: number; sub: number; node: TreeNode }[] = [];
-    for (const { s, pos } of stepsBy.get(container) ?? []) items.push({ key: pos, sub: 0, node: { type: 'step', step: s, depth } });
-    for (const g of kids.get(container) ?? []) {
-      const key = firstPos.get(g.id) ?? Infinity;
-      items.push({ key, sub: (g.order ?? gIdx.get(g.id) ?? 0) + 1, node: { type: 'group', group: g, depth, children: build(g.id, depth + 1), stepCount: countSteps(g.id) } });
-    }
-    items.sort((a, b) => (a.key === b.key ? a.sub - b.sub : a.key - b.key));
-    return items.map((i) => i.node);
+  const root: TreeNode[] = [];
+  const parts = new Map<string, number>();
+  const lastSection = new Map<string, GroupNode>();
+  const open = (id: string, into: TreeNode[], depth: number): GroupNode => {
+    const part = parts.get(id) ?? 0;
+    parts.set(id, part + 1);
+    const node: GroupNode = { type: 'group', group: byId.get(id)!, depth, children: [], stepCount: countSteps(id), part };
+    into.push(node);
+    lastSection.set(id, node);
+    return node;
   };
-  return build(null, 0);
+
+  let stack: GroupNode[] = [];
+  for (const s of ordered) {
+    const path = pathOf(containerOf(s, groups));
+    let keep = 0;
+    while (keep < stack.length && keep < path.length && stack[keep].group.id === path[keep]) keep++;
+    stack = stack.slice(0, keep);
+    for (let i = keep; i < path.length; i++) stack.push(open(path[i], i === 0 ? root : stack[i - 1].children, i));
+    (stack.length ? stack[stack.length - 1].children : root).push({ type: 'step', step: s, depth: path.length });
+  }
+
+  const sortKey = (g: StepGroup) => g.order ?? gIdx.get(g.id) ?? 0;
+  const place = (g: StepGroup): GroupNode => {
+    const have = lastSection.get(g.id);
+    if (have) return have;
+    const p = parents.get(g.id) ?? null;
+    const parentNode = p ? place(byId.get(p)!) : null;
+    return open(g.id, parentNode ? parentNode.children : root, parentNode ? parentNode.depth + 1 : 0);
+  };
+  for (const g of [...groups].sort((a, b) => sortKey(a) - sortKey(b))) if (!parts.has(g.id)) place(g);
+  return root;
 }
 
 /** 木を平らにする（折りたたまれたグループの中は含めない） */

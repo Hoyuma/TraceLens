@@ -4,7 +4,7 @@ import {
   sameReplayConfig, undefinedTemplateVariables, validateReplayConfig, validateSelectorText, validateWaitCondition, variableReport, visibleNodes,
   type GroupNode, type TreeNode,
 } from '../../src/review/logic';
-import { reorderSteps } from '../../src/shared/steps';
+import { orderedSteps, reorderSteps } from '../../src/shared/steps';
 import type { StepGroup } from '../../src/shared/types';
 import { mkScenario, mkStep } from './fixtures';
 
@@ -12,11 +12,26 @@ const g = (id: string, parentId: string | null = null, order?: number): StepGrou
 const ids = (nodes: TreeNode[]): string[] => nodes.map((n) => (n.type === 'step' ? `s${n.step.seq}` : `G:${n.group.id}[${ids(n.children).join(',')}]`));
 
 describe('手順のツリー', () => {
-  it('グループは中の最初の手順の位置に置き、入れ子にする', () => {
+  it('グループを入れ子にし、連続しない手順は見出しを繰り返して表示・再生順を保つ', () => {
     const steps = [mkStep(1), mkStep(2, { groupId: 'A' }), mkStep(3, { groupId: 'B' }), mkStep(4), mkStep(5, { groupId: 'A' })];
     const tree = buildStepTree([g('A'), g('B', 'A')], steps);
-    expect(ids(tree)).toEqual(['s1', 'G:A[s2,G:B[s3],s5]', 's4']);
+    expect(ids(tree)).toEqual(['s1', 'G:A[s2,G:B[s3]]', 's4', 'G:A[s5]']);
     expect((tree[1] as GroupNode).stepCount).toBe(3);
+    expect([(tree[1] as GroupNode).part, (tree[3] as GroupNode).part]).toEqual([0, 1]);
+  });
+
+  it('表示される手順の順序は orderedSteps（再生・出力の順）と一致する', () => {
+    // 手順 1 と 3 だけをグループにし、2 は外に残す（ドラッグやグループ指定で到達できる状態）
+    const steps = [mkStep(1, { groupId: 'A' }), mkStep(2), mkStep(3, { groupId: 'A' }), mkStep(4, { groupId: 'B' }), mkStep(5, { groupId: 'A', order: 1.5 })];
+    const groups = [g('A'), g('B', 'A')];
+    const shown = visibleNodes(buildStepTree(groups, steps), new Set()).flatMap((n) => (n.type === 'step' ? [n.step.seq] : []));
+    expect(shown).toEqual(orderedSteps(steps).map((s) => s.seq));
+    expect(ids(buildStepTree(groups, steps))).toEqual(['G:A[s1,s5]', 's2', 'G:A[s3,G:B[s4]]']);
+  });
+
+  it('手順のない子グループは、親の最後の区間の末尾に置く', () => {
+    const steps = [mkStep(1, { groupId: 'A' }), mkStep(2), mkStep(3, { groupId: 'A' })];
+    expect(ids(buildStepTree([g('A'), g('C', 'A')], steps))).toEqual(['G:A[s1]', 's2', 'G:A[s3,G:C[]]']);
   });
 
   it('並べ替え（order）を反映し、手順のないグループは末尾へ', () => {

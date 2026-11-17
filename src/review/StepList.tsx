@@ -110,12 +110,13 @@ export function StepList({ scenario, steps, selId, onSelect, onChanged, results,
     const ok = canDropGroup(g.id);
     const isOver = over?.key === g.id;
     const head = (
-      <li key={`g-${g.id}`} className={`g ${isOver && ok ? 'drop-into' : ''}`} style={{ paddingLeft: 4 + n.depth * 14 }} data-testid="group-row" data-group-id={g.id}
+      <li key={`g-${g.id}-${n.part}`} className={`g ${isOver && ok ? 'drop-into' : ''}`} style={{ paddingLeft: 4 + n.depth * 14 }} data-testid="group-row" data-group-id={g.id} data-part={n.part}
         draggable onDragStart={(e) => { e.dataTransfer.setData('text/plain', g.id); e.dataTransfer.effectAllowed = 'move'; setDrag({ kind: 'group', id: g.id }); }} onDragEnd={endDrag}
         onDragOver={(e) => { if (drag && drag.id !== g.id && ok) { e.preventDefault(); if (over?.key !== g.id) setOver({ key: g.id, where: 'into' }); } }}
         onDrop={(e) => { e.preventDefault(); if (ok) void dropOnGroup(g.id); else endDrag(); }}>
         <button className="link" data-testid="group-toggle" aria-label={open ? t('sl.collapse') : t('sl.expand')} aria-expanded={open} onClick={() => toggle(g.id)}>{open ? '▾' : '▸'}</button>
         <span title={t('sl.groupDragTitle')}>{g.name}</span>
+        {n.part > 0 && <span className="muted small" data-testid="group-continued">{' '}{t('sl.groupContinued')}</span>}
         <span className="muted">{' '}{t('sl.groupCount', { n: n.stepCount })}</span>
       </li>
     );
