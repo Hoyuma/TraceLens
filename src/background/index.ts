@@ -2,9 +2,15 @@
 // - 記録セッションの状態は chrome.storage.session、記録本体は IndexedDB に置き、
 //   Service Worker が停止・再起動しても保存済みの記録を失わない
 // - 収集対象は、ユーザーが記録を開始した1つのタブだけ
-import { SCHEMA_VERSION, emptyAnnotation, newId, type Artifact, type ArtifactPhase, type EnvironmentInfo, type ScreenshotMeta, type Step, type StepKind } from '../shared/types';
+import { SCHEMA_VERSION, emptyAnnotation, newId, type Artifact, type ArtifactPhase, type CaptureInfo, type EnvironmentInfo, type ScreenshotMeta, type Step, type StepKind } from '../shared/types';
+import { FULL_PAGE_LIMITS, cropForElement, planScroll, sameRect, type ScannedFrame } from '../shared/capture';
+import { decideBeforeScreenshot } from '../shared/beforeShot';
+import { applySwitch, decideOnCreated, decideOnRemoved, type TabRef, type TabSwitchState } from '../shared/tabSwitch';
+import { composeFullPage, cropBlob, imageSize } from './imageOps';
 import { addStep, getScenario, getStep, listScenarios, listSteps, patchScenario, patchStep, putArtifact } from '../shared/db';
-import { EVT_CHANGED, STATE_KEY, type ActiveSession, type ContentMsg, type DomFailure, type DomPayload, type FinishReply, type HelloReply, type ShotMetaReply, type StepDraft, type UiMsg, type UiReply } from '../shared/messages';
+import { initReplay, isReplayActive, onReplayPage, onReplayUi } from './replay';
+import type { ReplayPageMsg, ReplayUiMsg } from '../shared/messages';
+import { EVT_CHANGED, SETTINGS_KEY, STATE_KEY, type RecordSettings, type ScanBeginReply, type ScanEndReply, type ScanScrollReply, type ActiveSession, type ContentMsg, type DomFailure, type DomPayload, type FinishReply, type HelloReply, type ShotMetaReply, type StepDraft, type UiMsg, type UiReply } from '../shared/messages';
 
 const LAST_ENDED_KEY = 'tracelens.lastEnded';
 const CAPTURE_MIN_INTERVAL_MS = 600; // captureVisibleTab は毎秒2回まで (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND)
@@ -53,6 +59,8 @@ const INJECT_GUIDE: Record<string, string> = {
 
 // ---- ステップ保存 -----------------------------------------------------------
 const NO_SHOT: StepKind[] = ['notice'];
+const BEFORE_KINDS = new Set<StepKind>(['click', 'input', 'select', 'check', 'key']);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function storeDom(step: Step, dom: DomPayload | DomFailure | undefined): Promise<void> {
   if (!dom) return;
   if ('failed' in dom) { step.dom = { status: 'failed', reasonCode: 'serialize-error', reason: dom.reason }; return; }
@@ -70,6 +78,17 @@ async function storeStep(s: ActiveSession, draft: StepDraft, dom?: DomPayload | 
     dom: { status: 'pending' }, elementCapture: draft.elementCapture, limitations: draft.limitations ?? [],
     annotation: draft.annotation ?? emptyAnnotation(), includeInExport: true, ...over,
   };
+  if (s.beforeShot && BEFORE_KINDS.has(draft.kind)) {
+    // 新しい画像は作らない。直前の観測で取得した画像以降に画面変化の観測がなければ、その画像を参照する
+    const opMs = Date.parse(draft.operationAt);
+    let lastChange: { atMs: number; kind: import('../shared/beforeShot').ChangeKind } | null | undefined;
+    if (draft.observedChange === undefined) lastChange = undefined;
+    else {
+      const all = [...(draft.observedChange ? [draft.observedChange] : []), ...(s.changes ?? []).filter((c) => c.atMs < opMs)];
+      lastChange = all.length ? all.reduce((a, b) => (b.atMs > a.atMs ? b : a)) : null;
+    }
+    step.beforeScreenshot = decideBeforeScreenshot({ docEpoch: s.docEpoch, operationAtMs: opMs, viewport: draft.page.viewport, lastChange, prev: s.lastShot ?? null });
+  }
   await setS(s);
   await storeDom(step, dom);
   await addStep(step);
@@ -97,7 +116,7 @@ async function settlePending(scenarioId: string, sessionId: string, reason: stri
 // ---- 画面取得 ---------------------------------------------------------------
 let lastCaptureAt = 0;
 let capChain: Promise<unknown> = Promise.resolve();
-type Shot = { stepId: string; phase: ArtifactPhase };
+type Shot = { stepId: string; phase: ArtifactPhase; method?: 'visible' | 'element' };
 function requestShots(shots: Shot[], epoch: number, final = false, timingNote?: string): Promise<void> {
   const p = capChain.then(() => doShots(shots, epoch, final, timingNote));
   capChain = p.catch((e) => console.warn('[TraceLens] capture', e));
@@ -131,7 +150,10 @@ async function doShots(shots: Shot[], epoch: number, final: boolean, timingNote?
   if (!tab) return failShots(shots, 'tab-gone', '対象タブが閉じられていたため画面を取得できない');
   if (!tab.active) return failShots(shots, 'tab-inactive', '対象タブが前面に表示されていなかったため取得していない（他のタブの画像を混在させないため）');
   const metas = new Map<string, ScreenshotMeta>();
+  const metaStart = Date.now();
   for (const sh of shots) metas.set(sh.stepId, { ...(await getMeta(s.tabId, sh.stepId)), ...(timingNote ? { timingNote } : {}) });
+  // 要素選択の強調表示（TraceLens 自身のオーバーレイ）が画像に写らないよう、消えて描画されるのを待つ
+  if (shots.some((x) => x.method === 'element')) await sleep(160);
   lastCaptureAt = Date.now();
   let dataUrl: string;
   try {
@@ -147,12 +169,49 @@ async function doShots(shots: Shot[], epoch: number, final: boolean, timingNote?
   if (!tab2 || !tab2.active || (tab.url && tab2.url !== tab.url) || !s2 || s2.docEpoch !== epoch)
     return failShots(shots, 'changed-during-capture', '取得中にタブまたはページが切り替わったため、画像を破棄した');
   const blob = await (await fetch(dataUrl)).blob();
+  let kept = false;
   for (const sh of shots) {
-    const a: Artifact = { id: `shot_${sh.stepId}`, scenarioId: s.scenarioId, stepId: sh.stepId, type: 'screenshot', capturedAt, phase: sh.phase, includeInExport: true, blob, meta: metas.get(sh.stepId), masks: [] };
+    let out = blob; let meta = metas.get(sh.stepId); let info: CaptureInfo | undefined;
+    if (sh.method === 'element') {
+      const r = await cropElement(s.tabId, sh.stepId, blob, meta);
+      if (!r.ok) { await failShots([sh], r.code, r.reason); continue; }
+      out = r.blob; meta = r.meta; info = r.info;
+    }
+    const a: Artifact = { id: `shot_${sh.stepId}`, scenarioId: s.scenarioId, stepId: sh.stepId, type: 'screenshot', capturedAt, phase: sh.phase, includeInExport: true, blob: out, meta, masks: [], ...(info ? { captureInfo: info } : {}) };
     await putArtifact(a);
-    await patchStep(sh.stepId, (x) => { x.screenshot = { status: 'captured', artifactId: a.id }; });
+    const partial = info?.partial ? info.partialReason : undefined;
+    await patchStep(sh.stepId, (x) => {
+      x.screenshot = { status: 'captured', artifactId: a.id, ...(partial ? { reasonCode: 'partial', reason: partial } : {}) };
+      if (partial) x.limitations.push({ code: 'element-clipped', message: partial });
+    });
+    // 表示領域の通常取得は、次の操作の「操作前の画面」の参照元になりうる（切り出し・合成した画像は対象外）
+    if (!sh.method || sh.method === 'visible') {
+      const cur = await getS();
+      if (cur && cur.beforeShot && cur.docEpoch === epoch) { cur.lastShot = { artifactId: a.id, stepId: sh.stepId, capturedAt, startedAtMs: metaStart, docEpoch: epoch, viewport: meta?.viewport }; kept = true; }
+    }
   }
+  if (kept) { const cur = await getS(); if (cur) await setS(cur); }
   notify();
+}
+
+/** 取得した表示領域の画像から、要素の矩形で切り出す。取得の前後で位置を測り直して一致した場合だけ。 */
+async function cropElement(tabId: number, stepId: string, blob: Blob, meta?: ScreenshotMeta): Promise<{ ok: true; blob: Blob; meta: ScreenshotMeta; info: CaptureInfo } | { ok: false; code: string; reason: string }> {
+  const before = meta?.targetRectAtCapture, vp = meta?.viewport;
+  if (!before || !vp) return { ok: false, code: 'element-not-located', reason: `取得直前に要素の位置を確認できなかったため、要素の画像を切り出していない（${meta?.targetRectNote ?? '理由不明'}）` };
+  const after = (await getMeta(tabId, stepId)).targetRectAtCapture;
+  if (!sameRect(before, after)) return { ok: false, code: 'element-moved', reason: '取得の前後で要素の位置が一致しなかった（または確認できなかった）ため、要素の画像を切り出していない' };
+  const size = await imageSize(blob);
+  if (!size) return { ok: false, code: 'image-unsupported', reason: 'この環境では画像のサイズを読み取れないため、要素の画像を切り出せない' };
+  const c = cropForElement(before, vp, size.width, size.height);
+  if (!c) return { ok: false, code: 'element-outside', reason: '要素が表示領域の外にあったため、要素の画像を切り出していない' };
+  const cut = await cropBlob(blob, c.crop);
+  if (!cut.ok) return { ok: false, code: 'image-op-failed', reason: cut.reason };
+  const partialReason = c.clipped ? `要素の一部が表示領域の外にあったため、見えている部分（面積の約 ${Math.round(c.visibleRatio * 100)}%）だけを切り出した。表示領域外の部分は含まない` : undefined;
+  const info: CaptureInfo = {
+    method: 'element', cropRect: c.crop, elementRectCss: before, elementClipped: c.clipped, partial: c.clipped, partialReason,
+    notes: ['表示領域の画像から、取得直前と直後に確認した要素の矩形で切り出した画像。矩形内に重なっている他の要素やポップアップも写る。'],
+  };
+  return { ok: true, blob: cut.value, info, meta: { ...(meta as ScreenshotMeta), targetRectAtCapture: null, targetRectNote: '要素単位で切り出した画像のため、操作位置の強調はしない（要素の矩形は captureInfo に記録）' } };
 }
 
 // ---- コンテンツスクリプトからのメッセージ ------------------------------------
@@ -161,6 +220,10 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
   const tabId = sender.tab?.id;
   const mine = !!s && tabId === s.tabId;
   switch (msg.t) {
+    case 'change': {
+      if (s && mine && s.beforeShot) { s.changes = [...(s.changes ?? []), { atMs: msg.atMs, kind: msg.kind }].slice(-16); await setS(s); }
+      return { ok: true };
+    }
     case 'hello': {
       if (!s || !mine) return { recording: false, paused: false, picker: false, announce: null } satisfies HelloReply;
       let announce: HelloReply['announce'] = null;
@@ -174,7 +237,7 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
         s.lastUrl = msg.url; s.needsPermission = undefined; s.lastNoticeKey = undefined;
         await setS(s);
       }
-      return { recording: true, paused: s.status === 'paused', picker: s.picker, announce, fromUrl } satisfies HelloReply;
+      return { recording: true, paused: s.status === 'paused', picker: s.picker, pickerMode: s.pickerShot === 'element' ? 'element' : 'note', trackChanges: !!s.beforeShot, announce, fromUrl } satisfies HelloReply;
     }
     case 'step': {
       if (!s || !mine || s.status !== 'recording') return { ok: false };
@@ -190,7 +253,7 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
       const last = (await chrome.storage.session.get(LAST_ENDED_KEY))[LAST_ENDED_KEY] as { tabId: number; sessionId: string } | undefined;
       const st = await getStep(msg.stepId);
       if (!st) return { ok: false };
-      const ok = (mine && st.sessionId === s!.sessionId) || (!!last && last.tabId === tabId && last.sessionId === st.sessionId);
+      const ok = (mine && st.sessionId === s!.sessionId) || (!!last && last.tabId === tabId && last.sessionId === st.sessionId) || (!!s && s.sessionId === st.sessionId && !!s.tabStack?.some((t) => t.tabId === tabId)); // 切り替え前のタブからの、確定済みの手順への追記
       if (!ok) return { ok: false };
       await patchStep(msg.stepId, (x) => {
         if (msg.set?.value) x.value = msg.set.value;
@@ -203,7 +266,7 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
       return { ok: true };
     }
     case 'shot': {
-      if (!s || !mine || s.status !== 'recording') { await failShots(msg.shots, 'not-recording', '記録中ではないため画面を取得していない'); return { ok: false }; }
+      if (!s || !mine || s.status !== 'recording') { await failShots(msg.shots, s && !mine ? 'tab-switched' : 'not-recording', s && !mine ? '記録対象タブが切り替わったため、切り替え前のタブの画面は取得していない' : '記録中ではないため画面を取得していない'); return { ok: false }; }
       void requestShots(msg.shots, s.docEpoch, false, msg.timingNote);
       return { ok: true };
     }
@@ -236,8 +299,110 @@ async function endSession(s: ActiveSession, status: 'ended' | 'interrupted', end
   notify();
 }
 
-async function manualCapture(s: ActiveSession): Promise<UiReply> {
+const FULL_PAGE_NOTES = [
+  '固定ヘッダー・固定フッターなど画面に固定された要素は、各位置の画像に写るため重複して写ることがある',
+  '遅延読み込みやスクロールで内容が変わるページでは、各位置の取得時点の状態を継ぎ合わせた画像であり、実際の見た目と一致しないことがある',
+  '対象はウィンドウ自体のスクロール。ページ内の別のスクロール領域（overflow）の続きは取得しない',
+];
+
+/** ページ全体: 取得を始めたら、取得は captureVisibleTab の間隔に従って順に行う（記録のキューとは別に進める） */
+async function startFullPage(s: ActiveSession): Promise<UiReply> {
+  const begin = (await chrome.tabs.sendMessage(s.tabId, { t: 'scan-begin' }, { frameId: 0 }).catch(() => null)) as ScanBeginReply | null;
+  if (!begin) {
+    const st = await bgStep(s, 'manual-capture', { dom: { status: 'failed', reasonCode: 'page-unreachable', reason: 'ページに接続できないためDOMを取得できない（ブラウザ内部ページ、またはアクセス権の失効）' }, screenshot: { status: 'failed', reasonCode: 'page-unreachable', reason: 'ページに接続できないため、ページ全体を取得できない' } });
+    notify();
+    return { ok: true };
+  }
+  if (!begin.ok || !begin.stepId || !begin.viewport) return { ok: false, code: 'scan-refused', message: begin.reason ?? 'ページ全体を取得できません。' };
+  const p = capChain.then(() => runFullPage(s.tabId, begin, s.docEpoch, s.sessionId));
+  capChain = p.catch((e) => console.warn('[TraceLens] full-page', e));
+  return { ok: true };
+}
+async function waitStep(id: string, ms = 5000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { if (await getStep(id)) return true; await sleep(100); }
+  return false;
+}
+type Fail = { code: string; reason: string };
+async function runFullPage(tabId: number, begin: ScanBeginReply, epoch: number, sessionId: string): Promise<void> {
+  const stepId = begin.stepId!, vp = begin.viewport!;
+  const dpr = vp.devicePixelRatio || 1;
+  const plan = planScroll({ pageHeight: begin.pageHeight ?? vp.height, viewportWidth: vp.width, viewportHeight: vp.height, devicePixelRatio: dpr });
+  const frames: ScannedFrame[] = []; const blobs: Blob[] = [];
+  const notes = [...FULL_PAGE_NOTES];
+  if (begin.noWindowScroll) notes.push('ウィンドウ自体がスクロールしないページだった。内部のスクロール領域だけが動くページの場合、その続きは取得していない');
+  let fail: Fail | null = null; let firstAt = '', lastAt = ''; let heightChanged = false;
+  const check = async (): Promise<Fail | null> => {
+    const cur = await getS();
+    if (!cur || cur.sessionId !== sessionId) return { code: 'not-recording', reason: '記録が終了したため、ページ全体の取得を中止した' };
+    if (cur.status !== 'recording') return { code: 'paused', reason: '一時停止されたため、ページ全体の取得を中止した' };
+    if (cur.docEpoch !== epoch || cur.tabId !== tabId) return { code: 'page-changed', reason: '取得中にページまたは記録対象タブが切り替わったため、取得を破棄した' };
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t) return { code: 'tab-gone', reason: '対象タブが閉じられたため、取得を中止した' };
+    if (!t.active) return { code: 'tab-inactive', reason: '対象タブが前面に表示されなくなったため、取得を破棄した（他のタブの画像を混在させないため）' };
+    return null;
+  };
+  for (const y of plan.positions) {
+    if ((fail = await check())) break;
+    const r = (await chrome.tabs.sendMessage(tabId, { t: 'scan-scroll', y }, { frameId: 0 }).catch(() => null)) as ScanScrollReply | null;
+    if (!r || r.docToken !== begin.docToken) { fail = { code: 'page-changed', reason: '取得中にページへ接続できなくなった、またはページが切り替わったため、取得を破棄した' }; break; }
+    const maxY = Math.max(0, r.pageHeight - vp.height);
+    if (Math.abs(r.scrollY - y) > 2 && Math.abs(r.scrollY - maxY) > 2) { fail = { code: 'scroll-mismatch', reason: '指定したスクロール位置へ移動できなかった（ユーザーのスクロールなど）ため、取得を破棄した' }; break; }
+    if (Math.abs(r.pageHeight - (begin.pageHeight ?? 0)) > 2) heightChanged = true;
+    if (frames.length && frames[frames.length - 1].scrollY === r.scrollY) continue;
+    const wait = lastCaptureAt + CAPTURE_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    if ((fail = await check())) break;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) { fail = { code: 'tab-gone', reason: '対象タブが閉じられたため、取得を中止した' }; break; }
+    lastCaptureAt = Date.now();
+    let url: string;
+    try { url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }); } catch (e) {
+      const m = String((e as Error)?.message || e);
+      fail = { code: /permission|activeTab|all_urls/i.test(m) ? 'no-permission' : 'capture-error', reason: `画面取得に失敗: ${m}` }; break;
+    }
+    const at = iso(); firstAt ||= at; lastAt = at;
+    const tab2 = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab2 || !tab2.active || (tab.url && tab2.url !== tab.url)) { fail = { code: 'changed-during-capture', reason: '取得中にタブまたはページが切り替わったため、画像を破棄した' }; break; }
+    const b = await (await fetch(url)).blob();
+    const sz = await imageSize(b);
+    if (!sz) { fail = { code: 'image-unsupported', reason: 'この環境では画像のサイズを読み取れないため、合成できない' }; break; }
+    blobs.push(b); frames.push({ scrollY: r.scrollY, imageWidth: sz.width, imageHeight: sz.height });
+  }
+  // 終了時は必ずスクロール位置を戻す（失敗・中止のときも）
+  const end = (await chrome.tabs.sendMessage(tabId, { t: 'scan-end', x: vp.scrollX, y: vp.scrollY }, { frameId: 0 }).catch(() => null)) as ScanEndReply | null;
+  if (!fail && end?.interfered) fail = { code: 'user-interference', reason: '取得中にユーザー操作（スクロール・キー・クリックなど）があったため、画像を破棄した' };
+  if (!fail && !end) fail = { code: 'page-changed', reason: '取得の終了時にページへ接続できなかった（ページが切り替わった可能性）ため、画像を破棄した' };
+  if (!fail && !frames.length) fail = { code: 'no-frames', reason: '画像を取得できなかった' };
+  await waitStep(stepId);
+  if (!fail) fail = await check();
+  if (fail) { await failShots([{ stepId, phase: 'manual' }], fail.code, fail.reason); return; }
+  const c = await composeFullPage(blobs, frames, dpr, plan.coveredHeight);
+  if (!c.ok) { await failShots([{ stepId, phase: 'manual' }], 'image-op-failed', c.reason); return; }
+  if (heightChanged) notes.push('取得中にページの高さが変化した（遅延読み込みなど）。先頭の高さの計測値より後の部分は含まれない、または継ぎ目がずれることがある');
+  if (end && !end.restored) notes.push('スクロール位置を元に戻せなかった可能性がある');
+  const info: CaptureInfo = {
+    method: 'full-page', frameCount: frames.length, composedHeightCss: plan.coveredHeight, pageHeightCss: begin.pageHeight,
+    partial: plan.partial, partialReason: plan.partialReason, notes: [...notes, `各画像の取得時刻の範囲: ${firstAt} 〜 ${lastAt}`, `上限: 最大 ${FULL_PAGE_LIMITS.maxFrames} 枚・高さ ${FULL_PAGE_LIMITS.maxHeightDevicePx} デバイス px・合計 ${FULL_PAGE_LIMITS.maxTotalPixels} 画素`],
+  };
+  const st = await getStep(stepId);
+  const s = await getS();
+  const a: Artifact = {
+    id: `shot_${stepId}`, scenarioId: st?.scenarioId ?? s?.scenarioId ?? '', stepId, type: 'screenshot', capturedAt: lastAt, phase: 'manual', includeInExport: true, blob: c.value.blob, masks: [], captureInfo: info,
+    meta: { url: st?.page.url, viewport: vp, targetRectAtCapture: null, targetRectNote: 'ページ全体の合成画像のため、操作位置の強調はしない', timingNote: `ページ全体を ${frames.length} 枚のスクロール取得で合成した画像（各部分の取得時刻は異なる）。${plan.partial ? plan.partialReason + '。' : ''}固定ヘッダーの重複・遅延読み込み・スクロールで変化する内容は、実際の見た目と一致しないことがある` },
+  };
+  await putArtifact(a);
+  await patchStep(stepId, (x) => {
+    x.screenshot = { status: 'captured', artifactId: a.id, ...(plan.partial ? { reasonCode: 'partial', reason: plan.partialReason } : {}) };
+    x.limitations.push({ code: 'full-page-composite', message: 'ページ全体の画像は、スクロールしながら取得した表示領域の画像の合成であり、実際の見た目と一致しないことがある' });
+    if (plan.partial) x.limitations.push({ code: 'full-page-partial', message: plan.partialReason ?? '上限により途中までを取得した' });
+  });
+  notify();
+}
+
+async function manualCapture(s: ActiveSession, mode: 'visible' | 'full-page' = 'visible'): Promise<UiReply> {
   if (s.status !== 'recording') return { ok: false, code: 'paused', message: '一時停止中は画面を保存できません。再開してください。' };
+  if (mode === 'full-page') return startFullPage(s);
   const r = await chrome.tabs.sendMessage(s.tabId, { t: 'manual-capture' }, { frameId: 0 }).catch(() => null);
   if (!r) {
     // ページに接続できない（内部ページ・権限失効など）。DOMは取得失敗として残し、画像だけ試みる
@@ -259,7 +424,8 @@ async function onUi(msg: UiMsg): Promise<UiReply> {
       const tab = await chrome.tabs.get(msg.tabId).catch(() => null);
       if (!tab || tab.id === undefined) return { ok: false, code: 'no-tab', message: '記録対象のタブが見つかりません。' };
       const steps = await listSteps(sc.id);
-      const ns: ActiveSession = { scenarioId: sc.id, sessionId: newId('ses'), tabId: tab.id, windowId: tab.windowId, status: 'recording', startedAt: Date.now(), pausedAccumMs: 0, lastUrl: tab.url, awaitingStart: true, picker: false, nextSeq: (steps.at(-1)?.seq ?? 0) + 1, docEpoch: 0 };
+      const settings = ((await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY] as RecordSettings | undefined) ?? {};
+      const ns: ActiveSession = { scenarioId: sc.id, sessionId: newId('ses'), tabId: tab.id, windowId: tab.windowId, status: 'recording', startedAt: Date.now(), pausedAccumMs: 0, lastUrl: tab.url, awaitingStart: true, picker: false, beforeShot: !!settings?.beforeShot, followNewTab: !!settings?.followNewTab, tabStack: [], nextSeq: (steps.at(-1)?.seq ?? 0) + 1, docEpoch: 0 };
       await setS(ns);
       const r = await inject(tab.id);
       if (!r.ok) { await setS(null); return { ok: false, code: r.code, message: `${INJECT_GUIDE[r.code]}（詳細: ${r.message}）` }; }
@@ -300,10 +466,10 @@ async function onUi(msg: UiMsg): Promise<UiReply> {
       await endSession(s, 'ended', 'ユーザーが終了');
       return { ok: true, session: null };
     }
-    case 'ui:manual-capture': return s ? manualCapture(s) : { ok: false };
+    case 'ui:manual-capture': return s ? manualCapture(s, msg.mode) : { ok: false };
     case 'ui:picker': {
       if (!s || s.status !== 'recording') return { ok: false, message: '記録中のみ利用できます。' };
-      s.picker = msg.on; await setS(s); broadcastSync(s.tabId);
+      s.picker = msg.on; s.pickerShot = msg.on ? msg.shot : undefined; await setS(s); broadcastSync(s.tabId);
       return { ok: true, session: s };
     }
   }
@@ -311,11 +477,22 @@ async function onUi(msg: UiMsg): Promise<UiReply> {
 
 chrome.runtime.onMessage.addListener((msg: ContentMsg | UiMsg | { t: string }, sender, sendResponse) => {
   if (!msg || typeof msg.t !== 'string' || msg.t === EVT_CHANGED) return;
+  // 再生 (v2): 制御は replay.ts。UI からの指示は拡張ページ由来に限る。ページからは replay:acted だけを受け付ける。
+  if (msg.t === 'replay:acted') { void onReplayPage(msg as ReplayPageMsg, sender).then(sendResponse, () => sendResponse({ proceed: false })); return true; }
+  if (msg.t.startsWith('ui:replay-')) {
+    if (!sender.url?.startsWith(chrome.runtime.getURL(''))) return;
+    enqueue(() => onReplayUi(msg as ReplayUiMsg)).then(sendResponse, (e) => sendResponse({ ok: false, message: String(e) }));
+    return true;
+  }
   const isUi = msg.t.startsWith('ui:');
   if (isUi && sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // UI操作は拡張ページからのみ
-  enqueue(() => (isUi ? onUi(msg as UiMsg) : onContent(msg as ContentMsg, sender))).then(sendResponse, (e) => sendResponse({ ok: false, message: String(e) }));
+  enqueue(async () => {
+    if (msg.t === 'ui:start' && (await isReplayActive())) return { ok: false, code: 'replay-active', message: '再生中は記録を開始できません。再生を停止してから開始してください。' } satisfies UiReply;
+    return isUi ? onUi(msg as UiMsg) : onContent(msg as ContentMsg, sender);
+  }).then(sendResponse, (e) => sendResponse({ ok: false, message: String(e) }));
   return true;
 });
+initReplay();
 
 // ---- タブの監視（対象タブのみ） ----------------------------------------------
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
@@ -343,16 +520,71 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   void enqueue(async () => {
     const s = await getS();
-    if (!s || s.tabId !== tabId) return;
-    await endSession(s, 'ended', '対象タブが閉じられたため終了');
+    if (!s) return;
+    if (s.tabId !== tabId && !s.tabStack?.some((t) => t.tabId === tabId) && s.pendingSwitch?.tabId !== tabId) return;
+    if (!s.followNewTab && !s.tabStack?.length) { if (s.tabId === tabId) await endSession(s, 'ended', '対象タブが閉じられたため終了'); return; }
+    const st = swState(s);
+    const alive = new Set<number>();
+    for (const t of st.stack) if (await chrome.tabs.get(t.tabId).then(() => true, () => false)) alive.add(t.tabId);
+    const dec = decideOnRemoved(st, tabId, alive);
+    if (dec.action === 'none') { s.tabStack = dec.state.stack; s.pendingSwitch = dec.state.pending; await setS(s); notify(); return; }
+    if (dec.action === 'return') {
+      await moveRecording(s, dec.state, '切り替え先のタブが閉じられたため、元のタブへ戻した', 'tab-switch-from', 'tab-switch-back');
+      notify();
+      return;
+    }
+    if (!dec.stackWasEmpty && s.status === 'recording') {
+      await bgStep(s, 'notice', { notice: { code: 'tab-switch-end', message: '記録対象のタブが閉じられ、戻れる元のタブがないため、記録を終了した' }, dom: { status: 'not-applicable' } });
+    }
+    await endSession(s, 'ended', dec.stackWasEmpty ? '対象タブが閉じられたため終了' : '対象タブが閉じられ、戻れる元のタブがないため終了');
   });
 });
+
+// ---- 新規タブ・別ウィンドウへの記録対象の切り替え（任意設定。同時に記録するタブは常に 1 つ） --------
+const swState = (s: ActiveSession): TabSwitchState => ({ current: { tabId: s.tabId, windowId: s.windowId }, stack: s.tabStack ?? [], pending: s.pendingSwitch ?? null });
+async function describeTab(tabId: number): Promise<string> {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  return `タブ ${tabId}${t?.title ? `「${t.title}」` : ''}${t?.url ? `（${t.url}）` : ''}`;
+}
+async function hasHostAccess(url?: string): Promise<boolean> {
+  if (await chrome.permissions.contains({ origins: ['<all_urls>'] }).catch(() => false)) return true;
+  try { if (url && /^https?:/.test(url)) return await chrome.permissions.contains({ origins: [new URL(url).origin + '/*'] }); } catch { /* 無視 */ }
+  return false;
+}
+/** 記録対象を切り替える。前後に通知の手順を残し、docEpoch を上げ、保留中の成果物を確定する。 */
+async function moveRecording(s: ActiveSession, next: TabSwitchState, reason: string, codeBefore: string, codeAfter: string): Promise<void> {
+  const oldTabId = s.tabId;
+  const from = await describeTab(oldTabId), to = await describeTab(next.current.tabId);
+  if (s.status === 'recording') await bgStep(s, 'notice', { notice: { code: codeBefore, message: `記録対象を ${from} から ${to} へ切り替える（理由: ${reason}）。この通知までが切り替え前のタブの記録` }, dom: { status: 'not-applicable' } });
+  s.tabId = next.current.tabId; s.windowId = next.current.windowId; s.tabStack = next.stack; s.pendingSwitch = next.pending ?? null;
+  s.docEpoch++; s.lastUrl = undefined; s.needsPermission = undefined; s.lastNoticeKey = undefined; s.lastShot = undefined; s.changes = []; s.picker = false; s.pickerShot = undefined;
+  await setS(s);
+  await settlePending(s.scenarioId, s.sessionId, '記録対象タブが切り替わったため、この操作の画面は取得していない');
+  if (oldTabId !== s.tabId) broadcastSync(oldTabId); // 切り替え前のタブは、次の hello で記録対象でないと分かり停止する
+  await inject(s.tabId);
+  broadcastSync(s.tabId);
+  if (s.status === 'recording') await bgStep(s, 'notice', { notice: { code: codeAfter, message: `${to} を記録対象にした（切り替え元: ${from}。理由: ${reason}）。同時に記録するタブは 1 つで、切り替え前のタブの操作は記録されない` }, dom: { status: 'not-applicable' } });
+}
+
 chrome.tabs.onCreated.addListener((tab) => {
   void enqueue(async () => {
     const s = await getS();
     if (!s || s.status !== 'recording' || tab.openerTabId !== s.tabId) return;
+    if (s.followNewTab) {
+      const dec = decideOnCreated(swState(s), { enabled: true, recording: true, created: tab, hasAccess: await hasHostAccess(tab.url || tab.pendingUrl) });
+      if (dec.action === 'switch') { await moveRecording(s, applySwitch(swState(s), dec.to), '対象タブから新しいタブまたはウィンドウが開かれたため', 'tab-switch-from', 'tab-switch-to'); notify(); return; }
+      if (dec.action === 'pending') {
+        s.pendingSwitch = dec.to; await setS(s);
+        await bgStep(s, 'notice', {
+          notice: { code: 'new-tab-needs-permission', message: `記録対象タブから新しいタブまたはウィンドウ（タブ ${dec.to.tabId}）が開かれた。このタブへのアクセス権がないため記録対象を切り替えていない。新しいタブでツールバーの TraceLens アイコンをクリックすると、記録対象をそのタブへ切り替えて続ける` },
+          dom: { status: 'not-applicable' },
+        });
+        notify();
+        return;
+      }
+    }
     await bgStep(s, 'notice', {
-      notice: { code: 'new-tab-unsupported', message: '記録対象タブから新しいタブまたはウィンドウが開かれた。新しいタブ側の操作は記録していない（初期版は未対応）' },
+      notice: { code: 'new-tab-unsupported', message: '記録対象タブから新しいタブまたはウィンドウが開かれた。新しいタブ側の操作は記録していない（新規タブへの記録継続の設定が無効）' },
       dom: { status: 'not-applicable' },
     });
     notify();
@@ -365,6 +597,13 @@ chrome.action.onClicked.addListener((tab) => {
   if (tab.windowId !== undefined) chrome.sidePanel?.open({ windowId: tab.windowId }).catch(() => {});
   void enqueue(async () => {
     const s = await getS();
+    if (s && tab.id !== undefined && s.pendingSwitch?.tabId === tab.id && tab.id !== s.tabId) {
+      // 新しいタブで activeTab が付与された。記録対象をそのタブへ切り替えて続ける
+      const to: TabRef = { tabId: tab.id, windowId: tab.windowId };
+      await moveRecording(s, applySwitch(swState(s), to), 'ユーザーが新しいタブでアクセスを許可したため', 'tab-switch-from', 'tab-switch-to');
+      notify();
+      return;
+    }
     if (!s || tab.id !== s.tabId) return;
     const r = await inject(s.tabId);
     if (r.ok) { s.needsPermission = undefined; await setS(s); broadcastSync(s.tabId); }

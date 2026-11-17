@@ -3,7 +3,8 @@
 // - 記録中でない/一時停止中は何も送らない
 import type { ArtifactPhase, CaptureStatus, FrameHop, FrameInfo, Limitation, Observation, PageInfo, ScreenshotMeta, StepKind, ValueInfo } from '../shared/types';
 import { newId } from '../shared/types';
-import type { ContentMsg, DomFailure, DomPayload, FinishReply, HelloReply, ShotMetaReply, StepDraft, ToContentMsg } from '../shared/messages';
+import type { ContentMsg, DomFailure, DomPayload, FinishReply, HelloReply, ScanBeginReply, ScanEndReply, ScanScrollReply, ShotMetaReply, StepDraft, ToContentMsg } from '../shared/messages';
+import type { ChangeKind } from '../shared/beforeShot';
 import { describeElement, readValue } from '../shared/elementInfo';
 import { serializeDom } from '../shared/domSerialize';
 import { isSensitiveField, markSensitiveFields, REDACTED_NOTE } from '../shared/sensitive';
@@ -25,6 +26,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   let recording = false;
   let paused = false;
   let pickerOn = false;
+  let pickerMode: 'note' | 'element' = 'note';
   let dead = false;
   const active = () => recording && !paused && !dead;
   const iso = (ms: number = Date.now()) => new Date(ms).toISOString();
@@ -107,13 +109,42 @@ declare global { interface Window { __tracelensContent?: boolean } }
     }
     const frame = frameInfo();
     if (!isTop && frame.path.some((h) => h.crossOrigin)) limitations.push({ code: 'cross-origin-frame', message: 'クロスオリジンフレーム内の操作。フレームの経路は index のみで、親ページ内のセレクターは取得できない' });
-    return { id, kind, operationAt: iso(), page: pageInfo(), frame, target, elementCapture, limitations, ...extra };
+    return { id, kind, operationAt: iso(), page: pageInfo(), frame, target, elementCapture, limitations, ...(trackChanges ? { observedChange: lastChange } : {}), ...extra };
   }
   /** ユーザー操作のステップを送る。進行中の観測は「次の操作」により終了する。 */
   function emit(step: StepDraft, phase: ArtifactPhase = 'at-operation') {
+    flushChange();
     endObservation('next-operation');
     void send({ t: 'step', step, dom: snapshotDom(phase) });
   }
+
+  // ---- 操作前の画面の参照判定用: 画面変化を観測した時刻だけを持つ（内容は持たない・送らない） --------
+  // 観測の範囲（DOM の変化・スクロール・リサイズ）だけ。:hover・アニメーション・動画・canvas などは観測できない。
+  let trackChanges = false;
+  let lastChange: { atMs: number; kind: ChangeKind } | null = null;
+  let changeSentAt = 0;
+  let changeT: number | undefined;
+  function noteChange(kind: ChangeKind) {
+    if (!trackChanges) return;
+    lastChange = { atMs: Date.now(), kind };
+    const now = Date.now();
+    if (now - changeSentAt >= 100) { changeSentAt = now; void send({ t: 'change', atMs: lastChange.atMs, kind }); }
+    else if (changeT === undefined) changeT = window.setTimeout(() => { changeT = undefined; changeSentAt = Date.now(); if (lastChange) void send({ t: 'change', atMs: lastChange.atMs, kind: lastChange.kind }); }, 100);
+  }
+  function flushChange() {
+    if (changeT === undefined) return;
+    clearTimeout(changeT); changeT = undefined; changeSentAt = Date.now();
+    if (lastChange) void send({ t: 'change', atMs: lastChange.atMs, kind: lastChange.kind });
+  }
+  function setTracking(on: boolean) {
+    if (on === trackChanges) return;
+    trackChanges = on;
+    if (on) noteChange('tracking-start'); else lastChange = null;
+  }
+  // ページ全体の取得中は TraceLens 自身がスクロールするため、ここでは数えない（終了時に 1 回、スクロールとして数える）
+  let scanning = false;
+  window.addEventListener('scroll', () => { if (!scanning) noteChange('scroll'); }, { capture: true, passive: true });
+  window.addEventListener('resize', () => { if (!scanning) noteChange('resize'); }, { passive: true });
 
   // ---- 画面変化の観測（業務処理の完了判定ではない） ---------------------------
   // 最初の静止を観測した後も、次の操作か観測時間の上限までは変化を見続ける。
@@ -177,7 +208,13 @@ declare global { interface Window { __tracelensContent?: boolean } }
   }
 
   const LIVE_SEL = '[role="alert"],[role="status"],[role="alertdialog"],[role="dialog"],[aria-live],output,dialog';
+  const isOwnMutation = (r: MutationRecord) => {
+    const t = r.target.nodeType === 1 ? (r.target as Element) : r.target.parentElement;
+    if (!t || t.tagName.toLowerCase() === OVERLAY_TAG) return true;
+    return r.type === 'childList' && [...r.addedNodes, ...r.removedNodes].every((n) => (n as Element).tagName?.toLowerCase() === OVERLAY_TAG);
+  };
   const mo = new MutationObserver((records) => {
+    if (trackChanges && !scanning && records.some((r) => !isOwnMutation(r))) noteChange('dom');
     const o = obs;
     if (!o) return;
     let relevant = 0;
@@ -391,7 +428,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
     const step = makeStep('element-note', el, { value: readValue(el) });
     emit(step, 'manual');
     void send({ t: 'picker-done', cancelled: false, stepId: step.id });
-    void send({ t: 'shot', shots: [{ stepId: step.id, phase: 'manual' }] });
+    void send({ t: 'shot', shots: [{ stepId: step.id, phase: 'manual', method: pickerMode === 'element' ? 'element' : 'visible' }] });
   }
   function pickerKey(e: KeyboardEvent) {
     if (!pickerOn) return;
@@ -427,6 +464,45 @@ declare global { interface Window { __tracelensContent?: boolean } }
     }, true);
   }
 
+  // ---- ページ全体の取得（SW が各位置で captureVisibleTab して合成する。スクロールは TraceLens が起こしたもの） ----
+  // ユーザーの操作として記録しない（isTrusted でないため既存のハンドラーは反応しない）。取得中にユーザー操作があれば破棄させる。
+  let scanOrigin = { x: 0, y: 0 };
+  let scanInterfered = false;
+  let scanTimer: number | undefined;
+  const docToken = newId('doc');
+  const pageHeight = () => Math.max(document.documentElement?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0);
+  const onInterfere = (e: Event) => { if (scanning && e.isTrusted) scanInterfered = true; };
+  for (const t of ['wheel', 'keydown', 'pointerdown', 'touchstart']) window.addEventListener(t, onInterfere, { capture: true, passive: true });
+  const scrollNow = (x: number, y: number) => window.scrollTo({ left: x, top: y, behavior: 'instant' as ScrollBehavior });
+  function endScan(): ScanEndReply {
+    clearTimeout(scanTimer);
+    const was = scanning;
+    scanning = false;
+    if (was) { scrollNow(scanOrigin.x, scanOrigin.y); noteChange('scroll'); }
+    return { interfered: scanInterfered, restored: Math.abs(scrollY - scanOrigin.y) <= 2 && Math.abs(scrollX - scanOrigin.x) <= 2 };
+  }
+  function handleScan(msg: Extract<ToContentMsg, { t: 'scan-begin' | 'scan-scroll' | 'scan-end' }>, respond: (r: unknown) => void) {
+    if (msg.t === 'scan-begin') {
+      if (!active() || pickerOn || scanning) { respond({ ok: false, reason: pickerOn ? '要素選択中のためページ全体を取得できない' : scanning ? '別のページ全体の取得が進行中' : '記録中ではない' } satisfies ScanBeginReply); return; }
+      finalizeInput('other-operation');
+      const step = makeStep('manual-capture');
+      emit(step, 'manual');
+      scanOrigin = { x: Math.round(scrollX), y: Math.round(scrollY) };
+      scanning = true; scanInterfered = false;
+      scanTimer = window.setTimeout(() => { endScan(); }, 90000); // SW が途中で止まっても、スクロール位置を戻す
+      const h = pageHeight();
+      respond({ ok: true, stepId: step.id, docToken, pageHeight: h, viewport: pageInfo().viewport, noWindowScroll: h <= innerHeight + 1 } satisfies ScanBeginReply);
+      return;
+    }
+    if (msg.t === 'scan-scroll') {
+      if (!scanning) { respond({ scrollY: Math.round(scrollY), pageHeight: pageHeight(), docToken } satisfies ScanScrollReply); return; }
+      scrollNow(scanOrigin.x, msg.y);
+      window.setTimeout(() => respond({ scrollY: Math.round(scrollY), pageHeight: pageHeight(), docToken } satisfies ScanScrollReply), 120);
+      return;
+    }
+    respond(endScan());
+  }
+
   // ---- Service Worker との同期 ----------------------------------------------
   function whenLoaded(fn: () => void) {
     if (document.readyState === 'complete') { fn(); return; }
@@ -444,6 +520,8 @@ declare global { interface Window { __tracelensContent?: boolean } }
     recording = reply.recording; paused = reply.paused;
     if (wasActive && !active()) { finalizeInput('paused'); endObservation('paused'); }
     setObserving(active());
+    pickerMode = reply.pickerMode ?? 'note';
+    setTracking(active() && !!reply.trackChanges);
     setPicker(reply.picker && active());
     if (active()) { lastHref = location.href; markSensitiveFields(document); }
     if (!isTop || !active() || !reply.announce) return;
@@ -462,6 +540,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   chrome.runtime.onMessage.addListener((msg: ToContentMsg, _sender, sendResponse) => {
     if (dead) return;
     if (msg.t === 'sync') { void sync(false); return; }
+    if (msg.t === 'scan-begin' || msg.t === 'scan-scroll' || msg.t === 'scan-end') { if (isTop) handleScan(msg, sendResponse); return true; }
     if (msg.t === 'shot-meta') {
       const el = stepEls.get(msg.stepId)?.deref();
       if (!el && !isTop) return; // このフレームの要素ではない

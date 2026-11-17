@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>模擬勤怠 - 縦長ページ</title><link rel="stylesheet" href="style.css">
+<style>
+  .band { height: 600px; display: flex; align-items: center; justify-content: center; font-size: 28px; border-bottom: 1px solid #ccc; }
+  .band:nth-child(odd) { background: #eef3f7; }
+  #long-target { width: 320px; height: 90px; margin: 12px; padding: 8px; border: 2px solid #567; background: #fff8e1; }
+</style></head>
+<body>
+<header><strong>模擬勤怠システム（縦長ページ）</strong><a id="open-tab" href="login.html" target="_blank" rel="opener">別タブで開く</a></header>
+<main style="padding:8px">
+  <div id="long-target">取得対象の要素（要素単位の画像の検証用）</div>
+  <button id="btn-a" type="button">操作A</button>
+  <button id="btn-b" type="button">操作B</button>
+  <button id="btn-c" type="button">操作C</button>
+</main>
+<div class="band">区画 1</div><div class="band">区画 2</div><div class="band">区画 3</div><div class="band">区画 4</div>
+</body></html>

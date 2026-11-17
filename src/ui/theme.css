@@ -84,6 +84,10 @@ table.t th { color: var(--muted); font-weight: 600; }
 .hl { position: absolute; border: 2px solid #e2572b; box-shadow: 0 0 0 2px rgba(255,255,255,.7); border-radius: 3px; pointer-events: none; }
 .mask { position: absolute; background: #000; }
 .mask.draft { background: rgba(0,0,0,.6); outline: 1px dashed #fff; }
+.mask.blur { background: repeating-linear-gradient(45deg, rgba(110,110,110,.7) 0 6px, rgba(170,170,170,.7) 6px 12px); outline: 1px solid rgba(0,0,0,.5); }
+.mask.draft.crop { background: rgba(0,0,0,.15); outline: 2px dashed #2b6fe2; }
+.crop-frame { position: absolute; border: 2px dashed #2b6fe2; pointer-events: none; box-shadow: 0 0 0 2000px rgba(0,0,0,.25); }
+.shot-wrap.cropped { display: block; }
 .mask button { position: absolute; top: 0; right: 0; line-height: 1; padding: 1px 5px; font-size: 11px; border-radius: 0 0 0 4px; }
 .empty { padding: 40px 20px; text-align: center; color: var(--muted); }
 .modal-bg { position: fixed; inset: 0; background: rgba(15,23,32,.5); display: flex; align-items: center; justify-content: center; z-index: 10; }
@@ -99,3 +103,26 @@ table.t th { color: var(--muted); font-weight: 600; }
 .files ul { list-style: none; margin: 0; padding: 0; max-height: 380px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
 .files li { padding: 3px 8px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
 .files li.sel { background: var(--sel); } .files li:hover { background: var(--soft); }
+
+/* シナリオ編集・再生 */
+.slist li.g { display: flex; align-items: center; gap: 4px; cursor: grab; border-radius: 6px; }
+.slist li.g button.link { text-decoration: none; width: 14px; }
+.slist li.g.drop-into, .slist li.s.drop-into { background: var(--sel); outline: 1px dashed var(--accent); }
+.slist li.s.dragging { opacity: .4; }
+.slist li.s.drop-before { box-shadow: 0 -2px 0 var(--accent); }
+.slist li.s.drop-after { box-shadow: 0 2px 0 var(--accent); }
+.slist li.s.now { border-color: var(--rec); }
+.slist .pos { color: var(--accent); margin-left: 2px; }
+.slist .mv { display: inline-flex; gap: 2px; }
+button.mini { padding: 0 5px; line-height: 1.3; font-size: 11px; }
+.dropzone { border: 1px dashed var(--line); border-radius: 6px; padding: 5px; text-align: center; color: var(--muted); font-size: 11.5px; margin: 4px 0; }
+.dropzone.on { background: var(--sel); border-color: var(--accent); }
+.badge.origin { background: var(--sel); color: var(--accent); }
+.badge.origin.authored { background: var(--warn-bg); color: var(--warn-ink); }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); padding-bottom: 6px; margin-bottom: 6px; }
+.pick-list { list-style: none; margin: 4px 0 0; padding: 0; max-height: 240px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.pick-list li { padding: 2px 8px; border-bottom: 1px solid var(--soft); }
+.pick-list .n { width: 28px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.runs { list-style: none; margin: 0; padding: 0; max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.runs li { padding: 4px 8px; cursor: pointer; border-bottom: 1px solid var(--soft); }
+.runs li:hover { background: var(--soft); } .runs li.sel { background: var(--sel); }

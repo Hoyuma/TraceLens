@@ -120,7 +120,9 @@ describe('要素情報', () => {
   it('role は由来を区別し、名前は「候補」として由来つきで列挙する', () => {
     const pj = describeElement(document.getElementById('pj')!);
     expect(pj.role).toEqual({ value: 'combobox', source: 'implicit-heuristic' });
-    expect(pj.nameCandidates[0]).toEqual({ source: 'aria-label', value: 'PJ' });
+    // 先頭は accname 計算結果。従来の簡易推定の候補はそのまま残る
+    expect(pj.nameCandidates[0]).toEqual({ source: 'accname', value: 'PJ', rule: 'aria-label' });
+    expect(pj.nameCandidates).toContainEqual({ source: 'aria-label', value: 'PJ' });
     expect(pj.nameMethodNote).toContain('完全な Accessible Name 計算の結果ではない');
     const user = describeElement(document.getElementById('user')!);
     expect(user.labels).toEqual(['社員番号']);

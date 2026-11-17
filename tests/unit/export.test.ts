@@ -45,7 +45,7 @@ describe('エクスポート: 構成とステップIDの対応', () => {
     const paths = r.files.map((f) => f.path);
     for (const f of ['README.md', 'scenario.md', 'input-mapping.md', 'implementation-request.md', 'manifest.json', 'steps.json']) expect(paths).toContain(f);
     const sj = JSON.parse(textOf(r, 'steps.json'));
-    expect(sj.schemaVersion).toBe(1);
+    expect(sj.schemaVersion).toBe(2); // v2 で形式を拡張（項目の追加のみ）
     for (const s of sj.steps) {
       for (const p of [s.artifacts.screenshot.path, s.artifacts.dom.path, s.artifacts.dom.formStatePath, s.artifacts.element.path]) {
         expect(paths).toContain(p);
