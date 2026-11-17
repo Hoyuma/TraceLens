@@ -1,6 +1,6 @@
 // 再生スクリプトの中核（要素の特定・値の設定・待機条件の評価）。jsdom で検証する。
 import { afterEach, describe, expect, it } from 'vitest';
-import { applySelect, evaluateWait, executeAction, findTarget, matchOptions, setNativeValue, waitFor, UNTRUSTED_NOTE } from '../../src/replay/core';
+import { applySelect, evaluateWait, executeAction, findTarget, javascriptUrlLink, matchOptions, setNativeValue, waitFor, UNTRUSTED_NOTE } from '../../src/replay/core';
 import { matchFrame } from '../../src/background/replayFrames';
 import type { ReplaySelector, ResolvedReplayAction } from '../../src/shared/replay';
 
@@ -233,5 +233,56 @@ describe('フレームの解決', () => {
     expect(matchFrame(live, rec)).toMatchObject({ frameId: 22 });
     // URL でも絞れなければ特定できない理由を返す
     expect(matchFrame(live, rec.map((h) => ({ ...h, url: undefined })))).toEqual({ error: expect.stringContaining('2 件') });
+  });
+});
+
+describe('javascript: URL のリンクのクリック', () => {
+  it('要素自身か祖先の a / area の href が javascript: なら判定する（大文字・前後の空白を含む）', () => {
+    document.body.innerHTML = '<a id="j" href=" JavaScript:doSubmit()"><span id="in">送信</span></a><a id="n" href="/next">次へ</a><a id="h" href="#">#</a>';
+    expect(javascriptUrlLink(document.getElementById('j')!)).toBe(true);
+    expect(javascriptUrlLink(document.getElementById('in')!)).toBe(true);
+    expect(javascriptUrlLink(document.getElementById('n')!)).toBe(false);
+    expect(javascriptUrlLink(document.getElementById('h')!)).toBe(false);
+  });
+  it('javascript: のリンクは拡張側で click() せず、ページ側でのクリックを依頼する（二重にクリックしない）', async () => {
+    document.body.innerHTML = '<a id="j" href="javascript:void(0)">送信</a>';
+    const a = document.getElementById('j')!;
+    let isolatedClicks = 0;
+    a.addEventListener('click', (e) => { isolatedClicks++; e.preventDefault(); });
+    const asked: Element[] = [];
+    const r = await executeAction(act('click', { selectors: [css('#j')] }), { ...env(), mainWorldClick: async (el) => { asked.push(el); return { ok: true }; } });
+    expect(asked).toEqual([a]);
+    expect(isolatedClicks).toBe(0);
+    expect(r.status).toBe('ok');
+    expect(r.reason).toContain('ページ側（main world）でクリックした');
+  });
+  it('ページ側でクリックできない・依頼の手段がない場合は ok にせず失敗にする', async () => {
+    document.body.innerHTML = '<a id="j" href="javascript:void(0)">送信</a>';
+    const r1 = await executeAction(act('click', { selectors: [css('#j')] }), { ...env(), mainWorldClick: async () => ({ ok: false, reason: '文書が切り替わった' }) });
+    expect(r1.status).toBe('failed');
+    expect(r1.reason).toContain('文書が切り替わった');
+    const r2 = await executeAction(act('click', { selectors: [css('#j')] }), env());
+    expect(r2.status).toBe('failed');
+  });
+  it('通常のリンク・ボタンは従来どおり拡張側で click() する', async () => {
+    document.body.innerHTML = '<button id="b">保存</button>';
+    let n = 0;
+    document.getElementById('b')!.addEventListener('click', () => n++);
+    let asked = 0;
+    const r = await executeAction(act('click', { selectors: [css('#b')] }), { ...env(), mainWorldClick: async () => { asked++; return { ok: true }; } });
+    expect(r.status).toBe('ok');
+    expect(n).toBe(1);
+    expect(asked).toBe(0);
+  });
+  it('再生スクリプト（拡張）由来の CSP 違反を観測したら、待機条件を観測できても ok にしない。ページ自身の違反は数えない', async () => {
+    document.body.innerHTML = '<button id="b">保存</button><button id="c">次へ</button>';
+    const violate = (sourceFile: string) => { const e = new Event('securitypolicyviolation') as any; Object.assign(e, { sourceFile, effectiveDirective: 'script-src-elem', blockedURI: 'inline' }); document.dispatchEvent(e); };
+    document.getElementById('b')!.addEventListener('click', () => violate('chrome-extension://abc/replay.js'));
+    document.getElementById('c')!.addEventListener('click', () => violate('https://example.test/app.js'));
+    const r = await executeAction(act('click', { selectors: [css('#b')] }), env());
+    expect(r.status).toBe('failed');
+    expect(r.reason).toContain('CSP');
+    const r2 = await executeAction(act('click', { selectors: [css('#c')] }), env());
+    expect(r2.status).toBe('ok');
   });
 });

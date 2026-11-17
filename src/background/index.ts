@@ -477,8 +477,8 @@ async function onUi(msg: UiMsg): Promise<UiReply> {
 
 chrome.runtime.onMessage.addListener((msg: ContentMsg | UiMsg | { t: string }, sender, sendResponse) => {
   if (!msg || typeof msg.t !== 'string' || msg.t === EVT_CHANGED) return;
-  // 再生 (v2): 制御は replay.ts。UI からの指示は拡張ページ由来に限る。ページからは replay:acted だけを受け付ける。
-  if (msg.t === 'replay:acted') { void onReplayPage(msg as ReplayPageMsg, sender).then(sendResponse, () => sendResponse({ proceed: false })); return true; }
+  // 再生 (v2): 制御は replay.ts。UI からの指示は拡張ページ由来に限る。ページからは replay:acted と replay:main-click だけを受け付ける。
+  if (msg.t === 'replay:acted' || msg.t === 'replay:main-click') { void onReplayPage(msg as ReplayPageMsg, sender).then(sendResponse, () => sendResponse(msg.t === 'replay:acted' ? { proceed: false } : { ok: false, reason: 'Service Worker で例外が発生した' })); return true; }
   if (msg.t.startsWith('ui:replay-')) {
     if (!sender.url?.startsWith(chrome.runtime.getURL(''))) return;
     enqueue(() => onReplayUi(msg as ReplayUiMsg)).then(sendResponse, (e) => sendResponse({ ok: false, message: String(e) }));

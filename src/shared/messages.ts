@@ -177,7 +177,13 @@ export type ToReplayAuxMsg =
   | { t: 'replay:overlay'; text: string | null };
 
 /** (追加) 再生スクリプト → Service Worker: 対象要素を特定でき、これから操作する（文書が切り替わっても操作済みと分かるように先に知らせる） */
-export type ReplayPageMsg = { t: 'replay:acted'; runId: string; stepId: string; attemptId?: string };
+export type ReplayPageMsg =
+  | { t: 'replay:acted'; runId: string; stepId: string; attemptId?: string }
+  /** (追加) javascript: URL のリンクを、ページ側（main world）でクリックするよう依頼する。token はその要素に付けた印（MAIN_CLICK_ATTR） */
+  | { t: 'replay:main-click'; runId: string; stepId: string; attemptId?: string; token: string };
+export interface ReplayMainClickReply { ok: boolean; reason?: string }
+/** ページ側（main world）で click() してもらうための印。SW が world: 'MAIN' でこの属性の要素を探してクリックし、属性を外す */
+export const MAIN_CLICK_ATTR = 'data-tracelens-replay-click';
 export interface ReplayActedReply { proceed: boolean }
 
 /** replay:run への応答。ok は操作を実行し待機条件を観測できたという意味で、業務処理の完了ではない */
@@ -235,7 +241,7 @@ export interface ActiveReplay {
   /** トップ文書が切り替わるたびに増える（古いページ向けの応答を捨てるため） */
   docEpoch: number;
   /** (追加) 実行中の手順。acted: 操作を始めたことをページから受け取った（SW 再起動時に再試行してよいかの判定に使う） */
-  inFlight?: { position: number; stepId: string; attemptId: string; acted: boolean };
+  inFlight?: { position: number; stepId: string; attemptId: string; acted: boolean; /** (追加) javascript: URL のリンクをページ側（main world）でクリックした */ mainWorldClick?: boolean };
   /** (追加) SW が計画の先頭の移動先で新しいタブを開いた（先頭の navigate では再読み込みせず読み込み完了を待つだけにする） */
   openedTab?: boolean;
   /**

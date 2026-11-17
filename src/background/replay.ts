@@ -12,8 +12,8 @@ import {
   type ActedState, type ReplayAction, type ReplayRun, type ReplayRunStatus, type ReplayStepResult, type ResolvedReplayAction, type WaitOutcome,
 } from '../shared/replay';
 import {
-  EVT_CHANGED, REPLAY_STATE_KEY, STATE_KEY,
-  type ActiveReplay, type ActiveReplayWait, type ReplayActedReply, type ReplayPageMsg, type ReplayRunReply, type ReplayUiMsg, type ReplayUiReply, type ToReplayAuxMsg, type ToReplayMsg,
+  EVT_CHANGED, MAIN_CLICK_ATTR, REPLAY_STATE_KEY, STATE_KEY,
+  type ActiveReplay, type ActiveReplayWait, type ReplayActedReply, type ReplayMainClickReply, type ReplayPageMsg, type ReplayRunReply, type ReplayUiMsg, type ReplayUiReply, type ToReplayAuxMsg, type ToReplayMsg,
 } from '../shared/messages';
 import { KIND_LABEL } from '../shared/types';
 import type { ReplayFrameProbe, ReplayFrameSeen, ReplaySelector } from '../shared/replay';
@@ -34,6 +34,7 @@ const WAIT_CHUNK_MS = 60_000;
 const KEEPALIVE_MS = 20_000;
 /** # だけが違う URL への移動で、URL の変化を待つ上限 */
 const SAME_DOC_SETTLE_MS = 2_000;
+const MAIN_CLICK_NOTE = 'javascript: URL のリンクのため、ページ側（main world）でクリックした';
 /** 現在の URL が読めず、移動先に # がある場合: 読み込みの開始を観測できなくても、この時間の後に読み込み済みとみなす */
 const UNKNOWN_DOC_FALLBACK_MS = 3_000;
 /**
@@ -502,11 +503,13 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
       ctx.diag.add(`ページの応答: ${reply.status}${reply.href ? `（文書: ${reply.href}` : '（'}${reply.iframeCount !== undefined ? `、iframe/frame ${reply.iframeCount} 個` : ''}）`);
     } else ctx.diag.add(`操作の応答を受け取れなかった${sendError ? `: ${sendError}` : ''}`);
     if (ch.changed) ctx.diag.add(`操作の前後で文書が切り替わった（判定: ${ch.basis}）`);
+    let mainClicked = false;
     // 試行を締める: 以後、この試行についてのページからの replay:acted は受け付けない（操作したかを確定させる）
     const dec = await withLock(async () => {
       const cur = await getR();
       if (!cur || cur.runId !== r.runId) return null;
       const acted = cur.inFlight?.attemptId === attemptId && cur.inFlight.acted;
+      if (cur.inFlight?.attemptId === attemptId && cur.inFlight.mainWorldClick) mainClicked = true;
       const d = decideRunReply({ reply, acted, docChanged: ch.changed, failedSend, pastDeadline: Date.now() >= deadline, lastReason });
       cur.inFlight = undefined;
       // 操作の後に観測し直す場合は、印を残してから観測する（この間に SW が再起動しても、再開時に操作し直さない）
@@ -516,12 +519,14 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
     });
     if (!dec) return { kind: 'stale' };
     const rep = reply !== 'timeout' ? reply : undefined;
+    if (mainClicked) ctx.diag.add(MAIN_CLICK_NOTE);
     switch (dec.kind) {
       case 'fail': return failed(a.stepId, startedAt, dec.reason, { acted: dec.acted });
       case 'use-reply': {
         let reason = rep!.reason;
         // 対象要素が見つからなかった: ほかのフレームに同じ要素がないか調べ、理由に添える（そこでは操作しない）
         if (rep!.status === 'failed' && !rep!.selectorUsed && rep!.attempts?.length) reason = `${reason ?? ''}${await probeNote(r.tabId, action, f.frameId, f.frames, ctx)}`;
+        if (mainClicked && rep!.status === 'ok' && !reason) reason = MAIN_CLICK_NOTE;
         return { kind: 'done', result: { stepId: a.stepId, status: rep!.status, reason, selectorUsed: rep!.selectorUsed, matchCount: rep!.matchCount, waitOutcome: rep!.waitOutcome, startedAt, endedAt: rep!.status === 'manual' ? undefined : iso(), acted: dec.acted } };
       }
       case 'manual': return { kind: 'done', result: { stepId: a.stepId, status: 'manual', reason: rep?.reason, startedAt } };
@@ -529,7 +534,7 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
         // 操作の後に文書が切り替わった（ページ遷移）。古い文書での観測結果は使わず、新しい文書で待機条件を観測する
         return observeAfterAct(r, a, action, startedAt, deadline, {
           acted: dec.acted, selectorUsed: rep?.selectorUsed, matchCount: rep?.matchCount,
-          detail: dec.acted === 'yes' ? '操作の後に文書が切り替わった（ページ遷移）ため、待機条件は切り替わった後のページで観測した' : '操作の結果を受け取れなかった（操作は実行された可能性がある）ため、操作し直さず待機条件だけを観測した',
+          detail: joinDetail(mainClicked ? MAIN_CLICK_NOTE : undefined, dec.acted === 'yes' ? '操作の後に文書が切り替わった（ページ遷移）ため、待機条件は切り替わった後のページで観測した' : '操作の結果を受け取れなかった（操作は実行された可能性がある）ため、操作し直さず待機条件だけを観測した'),
         }, ctx);
       case 'retry':
         // 操作する前に接続が切れた（読み込み中・スクリプト未準備）。上限時間まで再試行する
@@ -830,8 +835,42 @@ export async function onReplayUi(msg: ReplayUiMsg): Promise<ReplayUiReply> {
   return reply;
 }
 
+/** 印（属性）の付いた要素を、ページ側の world で click() する（executeScript の func として渡す。自己完結であること） */
+function clickMarkedInMainWorld(attr: string, token: string): { ok: boolean; reason?: string } {
+  const el = document.querySelector(`[${attr}="${CSS.escape(token)}"]`) as HTMLElement | null;
+  if (!el) return { ok: false, reason: '印を付けた要素が見つからない（文書が切り替わった可能性がある）' };
+  el.removeAttribute(attr);
+  el.click();
+  return { ok: true };
+}
+
+/**
+ * 再生スクリプトから、javascript: URL のリンクをページ側（main world）でクリックする依頼。
+ * 承認済み（replay:acted で acted になった）同じ試行で、同じタブの依頼だけを受け付ける。送り元の文書（documentId）にだけ実行する。
+ */
+async function onMainClick(msg: Extract<ReplayPageMsg, { t: 'replay:main-click' }>, sender: chrome.runtime.MessageSender): Promise<ReplayMainClickReply> {
+  const ok = await withLock(async () => {
+    const r = await getR();
+    if (!r || sender.tab?.id !== r.tabId || r.runId !== msg.runId || r.status === 'stopping') return false;
+    const f = r.inFlight;
+    return !!f && f.stepId === msg.stepId && f.attemptId === msg.attemptId && f.acted;
+  });
+  if (!ok || sender.tab?.id === undefined) return { ok: false, reason: '再生の制御側で受け付けられなかった（再生の停止・試行の不一致）' };
+  await withLock(async () => { const r = await getR(); if (r?.inFlight && r.inFlight.attemptId === msg.attemptId) { r.inFlight.mainWorldClick = true; await setR(r); } });
+  const target: chrome.scripting.InjectionTarget = (sender as { documentId?: string }).documentId
+    ? { tabId: sender.tab.id, documentIds: [(sender as { documentId?: string }).documentId!] }
+    : { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] };
+  try {
+    const res = await chrome.scripting.executeScript({ target, world: 'MAIN', func: clickMarkedInMainWorld, args: [MAIN_CLICK_ATTR, msg.token] });
+    return (res[0]?.result as ReplayMainClickReply | undefined) ?? { ok: false, reason: 'ページ側での実行結果を受け取れなかった' };
+  } catch (e) {
+    return { ok: false, reason: `ページ側で実行できなかった: ${String((e as Error)?.message || e)}` };
+  }
+}
+
 /** 再生スクリプトからのメッセージ（対象タブ・同じ再生・同じ試行のものだけ受け付ける） */
-export async function onReplayPage(msg: ReplayPageMsg, sender: chrome.runtime.MessageSender): Promise<ReplayActedReply> {
+export async function onReplayPage(msg: ReplayPageMsg, sender: chrome.runtime.MessageSender): Promise<ReplayActedReply | ReplayMainClickReply> {
+  if (msg.t === 'replay:main-click') return onMainClick(msg, sender);
   return withLock(async () => {
     const r = await getR();
     if (!r || sender.tab?.id !== r.tabId || r.runId !== msg.runId) return { proceed: false };

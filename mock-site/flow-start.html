@@ -1,3 +1,7 @@
 <!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>ホーム</title><link rel="stylesheet" href="/style.css"></head>
-<body><main class="card"><h1>ホーム</h1><p><a id="open-apply" href="/flow/start">作業依頼</a></p></main></body></html>
+<body><main class="card"><h1>ホーム</h1>
+<!-- 模擬: 古い業務システムに多い javascript: URL のリンク（拡張の isolated world から click() すると拡張側の CSP でブロックされる） -->
+<p><a id="open-apply" href="javascript:openApply()">作業依頼</a></p></main>
+<script>function openApply() { location.href = '/flow/start'; }</script>
+</body></html>
