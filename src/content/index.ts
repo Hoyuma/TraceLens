@@ -125,7 +125,9 @@ declare global { interface Window { __tracelensContent?: boolean } }
   // 対象: このフレームの文書の、表示されている編集可能なテキスト系の入力欄で、値が入っていて、
   //       自動入力の表示があるか、HTML の初期値と違うもの。人が入力した欄・一度観測した欄は除く（文書ごと）。
   const PREFILL_MAX = 20;
-  const accounted = new WeakSet<Element>();
+  // 記録セッションごとに分ける（一時停止・再開では保つ。同じページで新しい記録を始めたら観測し直す）
+  let accounted = new WeakSet<Element>();
+  let accountedSession: string | undefined;
   function scanPrefilled(opEl: Element | null) {
     let n = 0;
     let list: NodeListOf<Element>;
@@ -562,6 +564,11 @@ declare global { interface Window { __tracelensContent?: boolean } }
     if (!reply) return;
     const wasActive = active();
     recording = reply.recording; paused = reply.paused;
+    if (reply.sessionId && reply.sessionId !== accountedSession) {
+      // 新しい記録セッション: 前のセッションで観測・入力した欄も、このセッションでは改めて観測する
+      if (accountedSession !== undefined) accounted = new WeakSet<Element>();
+      accountedSession = reply.sessionId;
+    }
     if (wasActive && !active()) { finalizeInput('paused'); endObservation('paused'); }
     setObserving(active());
     pickerMode = reply.pickerMode ?? 'note';

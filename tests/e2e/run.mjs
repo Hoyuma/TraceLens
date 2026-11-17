@@ -738,6 +738,18 @@ try {
     stP?.ok && JSON.stringify(kinds(psteps)) === JSON.stringify(['session-start', 'prefill', 'prefill', 'click', 'session-end']) && preUser?.value?.text === 'U-PREFILLED' && prePw?.value?.redacted === true && prePw.value.text === undefined && preUser.screenshot.status === 'not-applicable' && preUser.dom.status === 'not-applicable' && preUser.limitations.some((l) => l.code === 'prefill'),
     JSON.stringify(psteps.map((s) => [s.kind, s.target?.id, s.value, s.dom.status])));
   check('P31', '入力済みのパスワードの値が保存データのどこにも無い', !JSON.stringify(db).includes(PREFILL_PW), '');
+  // 同じページのまま（遷移せずに）別の記録を始めても、入力済みの値を改めて観測する（観測済みの扱いはセッションごと）
+  const preSc2 = 'scn_e2eprefill2';
+  await idbPut('scenarios', [{ schemaVersion: 2, id: preSc2, projectId, name: '入力済みの値（2 回目の記録）', purpose: '', preconditions: '', expectedResult: '', openQuestions: '', createdAt: nowIso, updatedAt: nowIso, sessions: [], groups: [], replacementRules: [], variables: [] }]);
+  const stP2 = await send({ t: 'ui:start', scenarioId: preSc2, tabId: preTabId });
+  await sleep(1500);
+  await pre.bringToFront();
+  await pre.click('#login');
+  await sleep(1200);
+  await send({ t: 'ui:stop' });
+  await sleep(800);
+  const psteps2 = (await dump(review)).steps.filter((s) => s.scenarioId === preSc2).sort((a, b) => a.seq - b.seq);
+  check('P35', '同じページで新しい記録を始めると、前の記録で観測した入力済みの値も改めて記録する', stP2?.ok && psteps2.filter((s) => s.kind === 'prefill').map((s) => s.target?.id).sort().join() === 'password,userId', JSON.stringify(psteps2.map((s) => [s.kind, s.target?.id])));
 
   // (1) 既定: 入力済みの値をそのまま使う（ページが値を入れる）
   const rP1 = await send({ t: 'ui:replay-start', scenarioId: preSc, mode: 'all', variableValues: {} });

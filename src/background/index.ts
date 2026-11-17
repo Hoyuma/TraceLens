@@ -237,7 +237,7 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
         s.lastUrl = msg.url; s.needsPermission = undefined; s.lastNoticeKey = undefined;
         await setS(s);
       }
-      return { recording: true, paused: s.status === 'paused', picker: s.picker, pickerMode: s.pickerShot === 'element' ? 'element' : 'note', trackChanges: !!s.beforeShot, announce, fromUrl } satisfies HelloReply;
+      return { recording: true, paused: s.status === 'paused', picker: s.picker, pickerMode: s.pickerShot === 'element' ? 'element' : 'note', trackChanges: !!s.beforeShot, announce, fromUrl, sessionId: s.sessionId } satisfies HelloReply;
     }
     case 'step': {
       if (!s || !mine || s.status !== 'recording') return { ok: false };

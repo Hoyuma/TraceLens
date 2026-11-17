@@ -49,6 +49,8 @@ export interface HelloReply {
   trackChanges?: boolean;
   announce: 'session-start' | 'navigation' | null;
   fromUrl?: string;
+  /** (追加) 記録中のセッションの ID。記録していなければ省略。入力済みの値の観測の範囲をセッションごとに分けるのに使う */
+  sessionId?: string;
 }
 
 export type ToContentMsg =
