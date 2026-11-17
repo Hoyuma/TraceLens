@@ -18,7 +18,7 @@ import {
 import { KIND_LABEL } from '../shared/types';
 import type { ReplayFrameProbe, ReplayFrameSeen, ReplaySelector } from '../shared/replay';
 import { describePath, matchFrame, type FrameCandidate } from './replayFrames';
-import { DiagLog, classifyInjectError, decideRunReply, documentChanged, isSameDocumentNavigation, missingOrigin, originOf, reloadTarget, stepEntryMode, stopMode, stoppedStepResult, type DocIds } from './replayLogic';
+import { DiagLog, classifyInjectError, decideRunReply, documentChanged, isSameDocumentNavigation, missingOrigin, originOf, reloadTarget, clickMarkedInMainWorld, stepEntryMode, stopMode, stoppedStepResult, type DocIds } from './replayLogic';
 
 const iso = (ms: number = Date.now()) => new Date(ms).toISOString();
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -833,15 +833,6 @@ export async function onReplayUi(msg: ReplayUiMsg): Promise<ReplayUiReply> {
   if (cur && (cur.status === 'running' || cur.status === 'stopping')) void drive();
   notify();
   return reply;
-}
-
-/** 印（属性）の付いた要素を、ページ側の world で click() する（executeScript の func として渡す。自己完結であること） */
-function clickMarkedInMainWorld(attr: string, token: string): { ok: boolean; reason?: string } {
-  const el = document.querySelector(`[${attr}="${CSS.escape(token)}"]`) as HTMLElement | null;
-  if (!el) return { ok: false, reason: '印を付けた要素が見つからない（文書が切り替わった可能性がある）' };
-  el.removeAttribute(attr);
-  el.click();
-  return { ok: true };
 }
 
 /**

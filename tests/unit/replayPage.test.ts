@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { applySelect, evaluateWait, executeAction, findTarget, javascriptUrlLink, matchOptions, setNativeValue, waitFor, UNTRUSTED_NOTE } from '../../src/replay/core';
 import { matchFrame } from '../../src/background/replayFrames';
+import { clickMarkedInMainWorld } from '../../src/background/replayLogic';
 import type { ReplaySelector, ResolvedReplayAction } from '../../src/shared/replay';
 
 const css = (selector: string, extra: Partial<ReplaySelector> = {}): ReplaySelector => ({ language: 'css', selector, source: 'recorded', scope: 'document', recordedMatchCount: 1, stability: 'unverified', ...extra });
@@ -317,5 +318,28 @@ describe('javascript: URL のリンクのクリック', () => {
     expect(r.reason).toContain('CSP');
     const r2 = await executeAction(act('click', { selectors: [css('#c')] }), env());
     expect(r2.status).toBe('ok');
+  });
+});
+
+describe('ページ側（main world）でのクリック', () => {
+  // jsdom には CSS.escape がない（印のトークンは英数字だけなので、そのまま返す代わりで足りる）
+  if (!(globalThis as any).CSS?.escape) (globalThis as any).CSS = { ...(globalThis as any).CSS, escape: (s: string) => s };
+  it('印の要素を click() し、印を外す', () => {
+    document.body.innerHTML = '<a id="a" href="#" data-m="t1">送信</a>';
+    let n = 0; document.getElementById('a')!.addEventListener('click', (e) => { n++; e.preventDefault(); });
+    expect(clickMarkedInMainWorld('data-m', 't1')).toEqual({ ok: true });
+    expect(n).toBe(1);
+    expect(document.getElementById('a')!.hasAttribute('data-m')).toBe(false);
+  });
+  it('click() を持たない要素（リンク内の SVG アイコン）は click イベントを送り、祖先のリンクへ伝わる', () => {
+    document.body.innerHTML = '<a id="a" href="#"><svg><path id="p" data-m="t2"></path></svg></a>';
+    let target: EventTarget | null = null;
+    document.getElementById('a')!.addEventListener('click', (e) => { target = e.target; e.preventDefault(); });
+    expect(clickMarkedInMainWorld('data-m', 't2')).toEqual({ ok: true });
+    expect(target).toBe(document.getElementById('p'));
+  });
+  it('印の要素がなければ理由つきで失敗', () => {
+    document.body.innerHTML = '';
+    expect(clickMarkedInMainWorld('data-m', 'x').ok).toBe(false);
   });
 });

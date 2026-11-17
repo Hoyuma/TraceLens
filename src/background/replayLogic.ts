@@ -162,3 +162,19 @@ export function reloadTarget(current: string | undefined, recorded: string | und
     return { url: u.href.replace(/#$/, ''), droppedFragment, usedRecorded: base !== current };
   } catch { return null; }
 }
+
+// ---- ページ側（main world）でのクリック ------------------------------------------------
+
+/**
+ * 印を付けた要素を、ページ側（main world）でクリックする。executeScript の func として直列化して渡すため、外の変数を参照しない。
+ * 再生は座標の一番手前の要素（記録した要素の子孫）に印を付けるため、SVG のアイコンなど click() を持たない要素のことがある。
+ * その場合は click イベントを送る（祖先のリンクへ伝わり、リンクの既定動作が起きる）。
+ */
+export function clickMarkedInMainWorld(attr: string, token: string): { ok: boolean; reason?: string } {
+  const el = document.querySelector(`[${attr}="${CSS.escape(token)}"]`);
+  if (!el) return { ok: false, reason: '印を付けた要素が見つからない（文書が切り替わった可能性がある）' };
+  el.removeAttribute(attr);
+  if (typeof (el as HTMLElement).click === 'function') (el as HTMLElement).click();
+  else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, detail: 1 }));
+  return { ok: true };
+}

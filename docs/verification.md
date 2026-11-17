@@ -208,9 +208,9 @@ e2e の過程で見つけて修正した点・検査を直した点:
 
 ## H. 2026-11-17 の再検証（候補一覧のクリックの修正後。Windows 11 / headless Chromium 159）— `npm run e2e` 98/98 成功
 
-- 実行: `npm run typecheck`、`npm test`（238 件）、`npm run e2e`（**98/98 成功**）。`npm run verify:real-permissions` は Linux 専用のため未実行。
+- 実行: `npm run typecheck`、`npm test`（241 件）、`npm run e2e`（**98/98 成功**）。`npm run verify:real-permissions` は Linux 専用のため未実行。
 - きっかけ: 実在の業務サイトの記録で、▼ボタンで開いた jQuery UI の autocomplete の候補一覧（`li > a`）の `li` をクリックする手順が、再生しても選択されなかった（前の手順の▼ボタンのクリックは効いていた）。
-- 単体テストで、jQuery UI 1.8 の autocomplete と同じ判定（mouseover で選択中の項目を決め、click は target が `.ui-menu-item a` の中のときだけ選択する）を再現し、修正後に選択されること、座標の要素が記録した要素の外のときはその要素へ送らないことを確認した（判断 56）。
+- 単体テストで、jQuery UI 1.8 の autocomplete と同じ判定（mouseover で選択中の項目を決め、click は target が `.ui-menu-item a` の中のときだけ選択する）を再現し、修正後に選択されること、座標の要素が記録した要素の外のときはその要素へ送らないことを確認した（判断 56）。main world でのクリックの送り先が `click()` を持たない SVG の要素でも、click イベントが祖先のリンクへ伝わることも確認した。
 - 未確認: jsdom には `elementFromPoint` がないため、単体テストでは置き換えて確かめた。実ブラウザの e2e には候補一覧の画面がなく、この修正の効果は e2e では確かめていない。業務サイトでの修正後の再生も未確認。
 
 ## 検証で見つけて修正した不具合
