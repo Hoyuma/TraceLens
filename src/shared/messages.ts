@@ -22,6 +22,8 @@ export interface StepDraft {
   elementCapture: CaptureStatus;
   limitations: Limitation[];
   annotation?: Annotation;
+  /** (追加) kind: 'prefill' の観測の内容 */
+  prefill?: Step['prefill'];
   /** 操作時点までに、このフレームで観測した最後の画面変化。null は観測なし、未指定は観測情報なし（操作前の画面の参照判定に使う） */
   observedChange?: { atMs: number; kind: ChangeKind } | null;
 }

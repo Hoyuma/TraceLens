@@ -102,7 +102,12 @@ export type StepKind =
   | 'navigation' | 'reload' | 'spa-navigation'
   | 'manual-capture' | 'element-note' | 'session-end' | 'notice'
   /** 人が追加した、待機条件だけの手順（origin: authored）(v2) */
-  | 'wait';
+  | 'wait'
+  /**
+   * 入力済みの値の観測 (v2)。人の操作ではない。操作の直前に、入力欄に値が入っていることを観測した
+   * （ブラウザの自動入力・入力内容の復元・ページのスクリプトなど。値が入った時刻・経緯は記録していない）。
+   */
+  | 'prefill';
 
 /** 取得状況。failed/skipped は必ず reason を持つ（空の成功データにしない）。 */
 export interface CaptureStatus {
@@ -252,6 +257,13 @@ export interface StepReplayConfig {
   timeoutMs?: number;
 }
 
+/**
+ * 入力済みの値の観測 (v2)。
+ * autofill: 観測した時点で、ブラウザの自動入力の表示（:autofill / :-webkit-autofill）に一致した。
+ * 一致しなくても自動入力ではないとは限らない（ブラウザによって表示や判定が異なる）。
+ */
+export interface PrefillInfo { autofill: boolean }
+
 /** 取り込み元の記録 (v2)。取り込んだ手順の元の番号・時刻はここに残す。 */
 export interface ImportedFrom {
   source: 'scenario' | 'export-zip';
@@ -311,6 +323,8 @@ export interface Step {
   replay?: StepReplayConfig;
   /** (v2) 取り込んだ手順の取り込み元 */
   importedFrom?: ImportedFrom;
+  /** (v2) kind: 'prefill' の観測の内容 */
+  prefill?: PrefillInfo;
   /**
    * (v2) 操作前の画面への参照（任意設定。既定は無効）。新しい画像ではなく、直前の観測で取得した画像を参照する。
    * 未設定は、設定が無効だった（または参照を試みていない）という意味。
@@ -423,7 +437,7 @@ export function newId(prefix: string): string {
 export const KIND_LABEL: Record<StepKind, string> = {
   'session-start': '記録開始', click: 'クリック', input: '入力', select: '選択', check: 'チェック', key: 'キー',
   navigation: 'ページ遷移', reload: '再読込', 'spa-navigation': 'URL変更(SPA)', 'manual-capture': '画面保存',
-  'element-note': '要素注記', 'session-end': '記録終了', notice: '通知', wait: '待機',
+  'element-note': '要素注記', 'session-end': '記録終了', notice: '通知', wait: '待機', prefill: '入力済みの値',
 };
 
 export const ORIGIN_LABEL: Record<StepOrigin, string> = { recorded: '記録', imported: '取り込み', authored: '人が追加' };

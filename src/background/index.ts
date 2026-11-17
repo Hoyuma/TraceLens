@@ -58,7 +58,7 @@ const INJECT_GUIDE: Record<string, string> = {
 };
 
 // ---- ステップ保存 -----------------------------------------------------------
-const NO_SHOT: StepKind[] = ['notice'];
+const NO_SHOT: StepKind[] = ['notice', 'prefill'];
 const BEFORE_KINDS = new Set<StepKind>(['click', 'input', 'select', 'check', 'key']);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function storeDom(step: Step, dom: DomPayload | DomFailure | undefined): Promise<void> {
@@ -73,7 +73,7 @@ async function storeStep(s: ActiveSession, draft: StepDraft, dom?: DomPayload | 
   const step: Step = {
     schemaVersion: SCHEMA_VERSION, id: draft.id, scenarioId: s.scenarioId, sessionId: s.sessionId, seq: s.nextSeq++,
     kind: draft.kind, operationAt: draft.operationAt, operationEndAt: draft.operationEndAt, page: draft.page, frame: draft.frame,
-    target: draft.target, value: draft.value, key: draft.key, navigation: draft.navigation,
+    target: draft.target, value: draft.value, key: draft.key, navigation: draft.navigation, ...(draft.prefill ? { prefill: draft.prefill } : {}),
     observations: [], screenshot: NO_SHOT.includes(draft.kind) ? { status: 'not-applicable' } : { status: 'pending' },
     dom: { status: 'pending' }, elementCapture: draft.elementCapture, limitations: draft.limitations ?? [],
     annotation: draft.annotation ?? emptyAnnotation(), includeInExport: true, ...over,
@@ -245,7 +245,8 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
       d.frame.browserFrameId = sender.frameId;
       if (!d.frame.isTop && sender.tab?.url) d.page = { ...d.page, url: sender.tab.url, title: sender.tab.title ?? d.page.title };
       if (d.kind === 'spa-navigation' && d.navigation) s.lastUrl = d.navigation.toUrl;
-      await storeStep(s, d, msg.dom, d.kind === 'session-start' || d.kind === 'navigation' || d.kind === 'reload' ? {} : msg.dom ? {} : { dom: { status: 'failed', reasonCode: 'no-dom', reason: 'DOMが送信されなかった' } });
+      // 入力済みの値の観測は、直後の操作の手順で DOM を保存するため、この手順では DOM を取得しない
+      await storeStep(s, d, msg.dom, d.kind === 'prefill' ? { dom: { status: 'not-applicable' } } : d.kind === 'session-start' || d.kind === 'navigation' || d.kind === 'reload' ? {} : msg.dom ? {} : { dom: { status: 'failed', reasonCode: 'no-dom', reason: 'DOMが送信されなかった' } });
       notify();
       return { ok: true };
     }

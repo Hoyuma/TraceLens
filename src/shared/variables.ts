@@ -50,6 +50,17 @@ export function resolveTemplate(template: string, values: Readonly<Record<string
   return { ok: missing.length === 0, text, missing };
 }
 
+/**
+ * テンプレートが {{変数}} だけでできていて（前後・間に文字を含まない）、その変数がすべて secret か。
+ * 機密欄に値を書き込んでよいのは、この場合だけ（値をテンプレートや既定値として保存しないため）。
+ */
+export function isSecretOnlyTemplate(template: string | undefined | null, secretNames: readonly string[]): boolean {
+  if (!template) return false;
+  if (template.replace(TEMPLATE_RE, '') !== '') return false;
+  const names = [...template.matchAll(TEMPLATE_RE)].map((m) => m[1]);
+  return names.length > 0 && names.every((n) => validateVariableName(n).ok && secretNames.includes(n));
+}
+
 /** 変数一覧の検査（名前の妥当性・重複）。問題がなければ空配列。 */
 export function validateVariables(vars: readonly ScenarioVariable[]): string[] {
   const errs: string[] = [];

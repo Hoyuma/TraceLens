@@ -7,7 +7,7 @@ import type { ContentMsg, DomFailure, DomPayload, FinishReply, HelloReply, ScanB
 import type { ChangeKind } from '../shared/beforeShot';
 import { describeElement, readValue } from '../shared/elementInfo';
 import { serializeDom } from '../shared/domSerialize';
-import { isSensitiveField, markSensitiveFields, REDACTED_NOTE } from '../shared/sensitive';
+import { fieldHasValue, isAutofilled, isSensitiveField, markSensitiveFields, REDACTED_NOTE, valueDiffersFromDefault } from '../shared/sensitive';
 import { cssPath } from '../shared/selectors';
 import { InputAggregator, type InputSession } from '../shared/inputAggregator';
 
@@ -112,10 +112,42 @@ declare global { interface Window { __tracelensContent?: boolean } }
     return { id, kind, operationAt: iso(), page: pageInfo(), frame, target, elementCapture, limitations, ...(trackChanges ? { observedChange: lastChange } : {}), ...extra };
   }
   /** ユーザー操作のステップを送る。進行中の観測は「次の操作」により終了する。 */
-  function emit(step: StepDraft, phase: ArtifactPhase = 'at-operation') {
+  function emit(step: StepDraft, phase: ArtifactPhase = 'at-operation', opEl?: Element | null) {
+    if (phase !== 'manual') scanPrefilled(opEl ?? null); // 画面保存・要素注記は操作ではないため観測しない
     flushChange();
     endObservation('next-operation');
     void send({ t: 'step', step, dom: snapshotDom(phase) });
+  }
+
+  // ---- 入力済みの値の観測 ---------------------------------------------------
+  // 人が入力していないのに値が入っている入力欄（ブラウザの自動入力・入力内容の復元・ページのスクリプトなど）を、
+  // 操作の直前に「入力済みの値」の手順として残す。人の操作ではない（原則 13）。再生では既定で値をそのまま使う。
+  // 対象: このフレームの文書の、表示されている編集可能なテキスト系の入力欄で、値が入っていて、
+  //       自動入力の表示があるか、HTML の初期値と違うもの。人が入力した欄・一度観測した欄は除く（文書ごと）。
+  const PREFILL_MAX = 20;
+  const accounted = new WeakSet<Element>();
+  function scanPrefilled(opEl: Element | null) {
+    let n = 0;
+    let list: NodeListOf<Element>;
+    try { list = document.querySelectorAll('input,textarea'); } catch { return; }
+    for (const el of Array.from(list)) {
+      if (n >= PREFILL_MAX) break;
+      if (el === opEl || accounted.has(el) || agg.current?.key === el) continue;
+      const f = el as HTMLInputElement;
+      if (!isTextLike(el) || f.type === 'file' || f.disabled || f.readOnly) continue;
+      if (!el.getClientRects().length) continue; // 表示されていない
+      if (!fieldHasValue(el)) continue;
+      const autofill = isAutofilled(el);
+      if (!autofill && !valueDiffersFromDefault(el)) continue;
+      accounted.add(el);
+      const sensitive = isSensitiveField(el);
+      const value: ValueInfo = sensitive ? { kind: 'redacted', redacted: true, redactionReason: REDACTED_NOTE } : { kind: 'text', text: textOf(el) ?? '' };
+      const step = makeStep('prefill', el, { value, prefill: { autofill } });
+      step.limitations.push({ code: 'prefill', message: '人の操作ではない。次の操作の直前に、入力欄に値が入っていることを観測した（値が入った時刻・経緯は記録していない。ブラウザの自動入力・入力内容の復元・ページのスクリプトなどが考えられる）' });
+      if (autofill) step.limitations.push({ code: 'browser-autofill', message: '観測した時点で、ブラウザの自動入力の表示（:autofill）があった。再生時はブラウザが同じ値を入れるとは限らず、人がページを操作するまで値をページに渡さないことがある' });
+      void send({ t: 'step', step });
+      n++;
+    }
   }
 
   // ---- 操作前の画面の参照判定用: 画面変化を観測した時刻だけを持つ（内容は持たない・送らない） --------
@@ -261,7 +293,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   let updateT: number | undefined;
   let lastFinal: { el: WeakRef<Element>; value: string | null } | null = null;
   const agg = new InputAggregator<Element>({
-    onStart(s) { emit(makeStep('input', s.key, { value: toValue(s) }, s.id)); },
+    onStart(s) { accounted.add(s.key); emit(makeStep('input', s.key, { value: toValue(s) }, s.id), 'at-operation', s.key); },
     onUpdate(s) {
       clearTimeout(updateT);
       updateT = window.setTimeout(() => { if (agg.current === s) void send({ t: 'patch', stepId: s.id, set: { value: toValue(s) } }); }, 800);
@@ -302,12 +334,19 @@ declare global { interface Window { __tracelensContent?: boolean } }
     finalizeInput('other-operation');
     const step = makeStep('click', el);
     if (e.detail === 0) step.limitations.push({ code: 'synthetic-activation', message: 'ポインター操作ではないクリック（キーボード操作やフォームの暗黙送信で発生）の可能性がある' });
-    emit(step);
+    emit(step, 'at-operation', el);
     beginObservation(step.id, 'after-operation');
   }
 
   const STEPPED_TYPES = new Set(['date', 'time', 'datetime-local', 'month', 'week', 'number', 'range', 'color']);
+  /** 記録していない間（一時停止中など）に人が編集した欄は、入力済みの値として観測しない（記録しない操作の内容を残さないため） */
+  function noteUnrecordedEdit(e: Event) {
+    if (!e.isTrusted || (active() && !pickerOn)) return;
+    const el = deepTarget(e);
+    if (el && !isOwn(el)) accounted.add(el);
+  }
   function onChange(e: Event) {
+    noteUnrecordedEdit(e);
     if (!e.isTrusted || pickerOn || !active()) return;
     const el = deepTarget(e);
     if (!el || isOwn(el)) return;
@@ -336,6 +375,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   }
 
   function onInput(e: Event) {
+    noteUnrecordedEdit(e);
     if (!e.isTrusted || pickerOn || !active()) return;
     const el = deepTarget(e);
     if (!el || isOwn(el) || !isTextLike(el)) return;

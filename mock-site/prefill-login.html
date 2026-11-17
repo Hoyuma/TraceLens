@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>模擬勤怠 - 入力済みのログイン</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<!--
+  ブラウザの自動入力（パスワードマネージャー）の代わりに、読み込み時にスクリプトで値を入れるページ。
+  実際の自動入力は自動テストから起こせないため、「人が入力していないのに値が入っている」状態だけを再現する。
+  localStorage の mock.noPrefill が '1' のときは値を入れない（再生時に自動入力されない状況の再現）。
+-->
+<form class="box" id="login-form" onsubmit="event.preventDefault(); show();">
+  <h1 style="font-size:18px;margin:0">模擬勤怠システム（入力済み）</h1>
+  <p style="color:#666;font-size:12px">動作確認用のページです。認証は行いません。</p>
+  <label for="userId">ユーザコード</label><input id="userId" name="userId" autocomplete="username">
+  <label for="password">パスワード</label><input id="password" name="password" type="password" autocomplete="current-password">
+  <div style="margin-top:14px"><button id="login" type="submit">ログイン</button></div>
+  <p id="result" style="font-size:12px"></p>
+</form>
+<script>
+  if (localStorage.getItem('mock.noPrefill') !== '1') {
+    setTimeout(() => {
+      document.getElementById('userId').value = 'U-PREFILLED';
+      document.getElementById('password').value = 'Prefilled#Pw-2604';
+    }, 100);
+  }
+  function show() {
+    const u = document.getElementById('userId').value;
+    const p = document.getElementById('password').value;
+    // パスワードは長さだけを表示する
+    document.getElementById('result').textContent = u && p ? `送信内容: user=${u} / pw-length=${p.length}` : '入力されていない項目がある';
+  }
+</script>
+</body></html>

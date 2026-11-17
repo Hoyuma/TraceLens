@@ -131,7 +131,7 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
   useEffect(() => { setRetryArmed(false); }, [wrKey]);
   const retryRisk = wr?.code === 'failed-step' && (wr.acted === 'yes' || wr.acted === 'possibly') ? wr.acted : null;
   const cur = replay ? replay.plan[replay.position] : undefined;
-  const missingBlocking = pf.missingVariables.length > 0;
+  const missingBlocking = pf.missingVariables.length > 0 || pf.sensitiveTemplates.length > 0;
 
   return (
     <div className="card" style={{ marginBottom: 10 }} data-testid="replay-panel">
@@ -237,6 +237,7 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
           <div className="small muted" data-testid="replay-tab-note">{t('rp.tabNote')}</div>
 
           {pf.manualSteps.length > 0 && <div className="note info" data-testid="replay-manual-list">{t('rp.manualList', { list: pf.manualSteps.map((m) => t('rv.step', { seq: m.seq })).join(t('var.sep')) })}<div className="small">{[...new Set(pf.manualSteps.map((m) => m.reason))].join(' / ')}</div></div>}
+          {pf.sensitiveTemplates.length > 0 && <div className="note err" data-testid="replay-sensitive-block">{t('rp.sensitiveBlock', { list: pf.sensitiveTemplates.map((m) => t('rv.step', { seq: m.seq })).join(t('var.sep')) })}</div>}
           {pf.unsupported.length > 0 && <div className="note info" data-testid="replay-unsupported-list">{t('rp.unsupported', { list: pf.unsupported.map((m) => t('rv.step', { seq: m.seq })).join(t('var.sep')) })}</div>}
 
           {names.length > 0 && (
@@ -269,7 +270,7 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
           {msg && <div className="note err" data-testid="replay-error">{msg}</div>}
           <div className="row" style={{ marginTop: 8 }}>
             <button className="primary" data-testid="replay-start" disabled={busy || !!startBlock || !('plan' in planRes) || plan.length === 0 || missingBlocking} onClick={start}>{t('rp.start')}</button>
-            {missingBlocking && <span className="small muted">{t('rp.missingBlock')}</span>}
+            {pf.missingVariables.length > 0 && <span className="small muted">{t('rp.missingBlock')}</span>}
           </div>
         </div>
       )}

@@ -8,7 +8,7 @@
 import { SCHEMA_VERSION, newId, type FrameHop, type WaitCondition } from '../shared/types';
 import { getScenario, listReplayRuns, listScenarios, listSteps, patchReplayRun, putReplayRun } from '../shared/db';
 import {
-  RELOAD_AS_GET_NOTE, buildReplayPlan, initialResults, planVariableNames, preflight, recordVariableValues, resolveAction,
+  RELOAD_AS_GET_NOTE, SENSITIVE_TEMPLATE_REASON, buildReplayPlan, initialResults, planVariableNames, preflight, recordVariableValues, resolveAction,
   type ActedState, type ReplayAction, type ReplayRun, type ReplayRunStatus, type ReplayStepResult, type ResolvedReplayAction, type WaitOutcome,
 } from '../shared/replay';
 import {
@@ -373,7 +373,8 @@ async function execStep(r: ActiveReplay, a: ReplayAction, ctx: ExecCtx): Promise
     return { kind: 'pause', wait: { code: 'manual-step', stepId: a.stepId, message: reason }, result: { stepId: a.stepId, status: 'manual', reason, startedAt } };
   }
   const values = { ...r.variableValues, ...(secretMem.get(r.runId) ?? {}) };
-  const res = resolveAction(a, values);
+  const res = resolveAction(a, values, r.secretVariableNames);
+  if (!res.ok && res.reason) return failed(a.stepId, startedAt, res.reason, { acted: 'no' });
   if (!res.ok) {
     const secrets = res.missing.filter((n) => r.secretVariableNames.includes(n));
     if (secrets.length) return { kind: 'pause', wait: { code: 'secret-required', names: secrets, message: `機密の変数（${secrets.join(', ')}）の値がない（Service Worker の再起動で失われた可能性がある）。値を入力して再開してください` } };
@@ -675,6 +676,7 @@ async function start(msg: Extract<ReplayUiMsg, { t: 'ui:replay-start' }>): Promi
   const provided: Record<string, string | undefined> = { ...(msg.variableValues ?? {}) };
   const pf = preflight(plan, variables, provided);
   if (pf.missingVariables.length) return { ok: false, code: 'preflight', message: `値が決まらない変数があります: ${pf.missingVariables.map((m) => m.name).join(', ')}`, preflight: pf };
+  if (pf.sensitiveTemplates.length) return { ok: false, code: 'preflight', message: `機密欄の値テンプレートに、secret の変数以外が含まれている手順があります（手順 ${pf.sensitiveTemplates.map((m) => m.seq).join(', ')}）。${SENSITIVE_TEMPLATE_REASON}`, preflight: pf };
 
   const names = planVariableNames(plan);
   const secretNames = names.filter((n) => variables.find((v) => v.name === n)?.secret);

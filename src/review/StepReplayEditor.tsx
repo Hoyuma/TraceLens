@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { patchScenario, patchStep } from '../shared/db';
-import { templateProblems } from '../shared/variables';
-import { newVariable } from '../shared/variables';
+import { isSecretOnlyTemplate, newVariable, templateProblems, validateVariableName } from '../shared/variables';
 import { valueLabel } from '../shared/describe';
 import { DEFAULT_REPLAY_TIMEOUT_MS } from '../shared/replay';
 import { getLang, t, trKnown } from '../ui/i18n';
@@ -19,9 +18,14 @@ export function StepReplayEditor({ step, scenario, onSaved }: { step: Step; scen
   const vars = scenario.variables ?? [];
   const secret = isSecretStep(step);
   const isFiles = step.value?.kind === 'files';
-  const takesValue = step.kind === 'input' || step.kind === 'select';
+  const isPrefill = step.kind === 'prefill';
+  const takesValue = step.kind === 'input' || step.kind === 'select' || isPrefill;
+  const secretVars = vars.filter((v) => v.secret);
+  const [newSecret, setNewSecret] = useState('');
   const takesSelector = !!step.target || ['click', 'input', 'select', 'check'].includes(step.kind);
-  const errors = validateReplayConfig(draft);
+  // 機密欄の値は secret の変数だけから作る（テンプレートの文字や既定値として保存しないため）
+  const secretErr = secret && draft.valueTemplate !== undefined && !isSecretOnlyTemplate(draft.valueTemplate, secretVars.map((v) => v.name)) ? t('sre.secretOnly') : null;
+  const errors = [...validateReplayConfig(draft), ...(secretErr ? [secretErr] : [])];
   const dirty = !sameReplayConfig(step.replay, draft);
   const useTemplate = draft.valueTemplate !== undefined;
   const undef = undefinedTemplateVariables(draft.valueTemplate, vars);
@@ -35,10 +39,12 @@ export function StepReplayEditor({ step, scenario, onSaved }: { step: Step; scen
     await patchStep(step.id, (s) => { if (c) s.replay = c; else delete s.replay; });
     setMsg(t('sre.saved')); onSaved();
   };
-  const addVariable = async (name: string) => {
-    await patchScenario(scenario.id, (s) => { if (!(s.variables ?? []).some((v) => v.name === name)) s.variables = [...(s.variables ?? []), newVariable(name)]; });
+  const addVariable = async (name: string, over: { secret?: boolean } = {}) => {
+    await patchScenario(scenario.id, (s) => { if (!(s.variables ?? []).some((v) => v.name === name)) s.variables = [...(s.variables ?? []), newVariable(name, over)]; });
     onSaved();
   };
+  const newSecretErr = newSecret ? (vars.some((v) => v.name === newSecret) ? t('sre.secretVarExists') : (() => { const r = validateVariableName(newSecret); return r.ok ? null : trKnown(r.reason); })()) : null;
+  const pickedSecret = secret && draft.valueTemplate !== undefined ? /^\{\{\s*([^{}]*?)\s*\}\}$/.exec(draft.valueTemplate)?.[1] ?? '' : '';
 
   return (
     <div data-testid="replay-editor">
@@ -49,16 +55,36 @@ export function StepReplayEditor({ step, scenario, onSaved }: { step: Step; scen
       {takesValue && (
         <div className="f" style={{ marginTop: 10 }}>
           <span className="small muted">{t('sre.valueTitle')}</span>
-          {secret ? (
-            <div className="note info" data-testid="replay-secret-note">{t('sre.secretNote')}</div>
-          ) : isFiles ? (
+          {secret ? (<>
+            <label className="row small" style={{ gap: 4 }}>
+              <input type="radio" name={`sv-${step.id}`} data-testid="replay-secret-wait" checked={!useTemplate} onChange={() => { const { valueTemplate: _x, ...rest } = draft; setDraft(rest); setMsg(''); }} />
+              {isPrefill ? t('sre.secretKeep') : t('sre.secretWait')}
+            </label>
+            <label className="row small" style={{ gap: 4 }}>
+              <input type="radio" name={`sv-${step.id}`} data-testid="replay-secret-var" checked={useTemplate} onChange={() => set({ valueTemplate: secretVars[0] ? `{{${secretVars[0].name}}}` : '' })} />
+              {t('sre.secretVar')}
+            </label>
+            {useTemplate && (<>
+              <div className="row" style={{ marginTop: 4, flexWrap: 'wrap' }}>
+                <select data-testid="replay-secret-pick" style={{ width: 'auto', minWidth: 160 }} value={pickedSecret} onChange={(e) => set({ valueTemplate: e.target.value ? `{{${e.target.value}}}` : '' })} aria-label={t('sre.secretVarPick')}>
+                  <option value="">{t('sre.secretVarPickOpt')}</option>
+                  {secretVars.map((v) => <option key={v.id} value={v.name}>{v.name}</option>)}
+                </select>
+                <input data-testid="replay-secret-new" style={{ width: 160 }} value={newSecret} placeholder={t('sre.secretVarNew')} onChange={(e) => setNewSecret(e.target.value.trim())} />
+                <button data-testid="replay-secret-add" disabled={!newSecret || !!newSecretErr} onClick={() => { const n = newSecret; void addVariable(n, { secret: true }).then(() => { set({ valueTemplate: `{{${n}}}` }); setNewSecret(''); }); }}>{t('sre.secretVarAdd')}</button>
+              </div>
+              {newSecretErr && <div className="note err">{newSecretErr}</div>}
+              <div className="small muted">{t('sre.secretVarNote')}</div>
+            </>)}
+            {!useTemplate && <div className="note info" data-testid="replay-secret-note">{isPrefill ? t('sre.secretKeepNote') : t('sre.secretNote')}</div>}
+          </>) : isFiles ? (
             <div className="note info" data-testid="replay-files-note">{t('sre.filesNote')}</div>
           ) : (<>
             <label className="row small" style={{ gap: 4 }}>
               <input type="checkbox" data-testid="replay-vt-use" checked={useTemplate} onChange={(e) => { const on = e.target.checked; if (on) set({ valueTemplate: step.value?.kind === 'text' ? step.value.text ?? '' : '' }); else { const { valueTemplate: _x, ...rest } = draft; setDraft(rest); setMsg(''); } }} />
-              {t('sre.useTemplate')}
+              {isPrefill ? t('sre.prefillUseTemplate') : t('sre.useTemplate')}
             </label>
-            {!useTemplate && <div className="small muted">{t('sre.useRecorded', { v: valueLabel(step, getLang()) || t('sre.none') })}</div>}
+            {!useTemplate && <div className="small muted" data-testid="replay-value-mode">{isPrefill ? t('sre.prefillKeep', { v: valueLabel(step, getLang()) || t('sre.none') }) : t('sre.useRecorded', { v: valueLabel(step, getLang()) || t('sre.none') })}</div>}
             {useTemplate && (<>
               <div className="row" style={{ marginTop: 4 }}>
                 <input data-testid="replay-vt" className="grow" value={draft.valueTemplate ?? ''} placeholder={t('sre.vtPh')} onChange={(e) => set({ valueTemplate: e.target.value })} />

@@ -340,7 +340,7 @@ export async function buildExport(input: ExportInput): Promise<ExportResult> {
       },
       page: step.page, frame: step.frame,
       target: step.target ? { tag: step.target.tag, id: step.target.id ?? null, name: step.target.name ?? null, type: step.target.type ?? null, role: step.target.role, nameCandidates: step.target.nameCandidates, nameMethodNote: step.target.nameMethodNote, rectAtOperation: step.target.rect, shadowPath: step.target.shadowPath, selectorCandidates: step.target.selectors } : null,
-      value: step.value ?? null, key: step.key ?? null, navigation: step.navigation ?? null, notice: step.notice ?? null,
+      value: step.value ?? null, key: step.key ?? null, navigation: step.navigation ?? null, notice: step.notice ?? null, prefill: step.prefill ?? null,
       annotation: step.annotation,
       replay: step.replay ?? null,
       replayResult: runResult.get(step.id) ?? null,
@@ -446,10 +446,12 @@ interface MdCtx { project: Project; scenario: Scenario; steps: Step[]; records: 
 /** 手順の再生設定の行（設定がなければ空配列） */
 function replayLines(st: Step): string[] {
   const r = st.replay;
-  if (!r && st.kind !== 'wait') return [];
+  if (!r && st.kind !== 'wait' && st.kind !== 'prefill') return [];
   const L: string[] = ['- 再生設定:'];
   if (r?.skip) L.push('  - 再生しない（skip）');
-  if (r?.valueTemplate !== undefined) L.push(`  - 値テンプレート: \`${md(r.valueTemplate)}\``);
+  const redacted = st.value?.kind === 'redacted' || !!st.value?.redacted;
+  if (r?.valueTemplate !== undefined) L.push(`  - 値テンプレート: \`${md(r.valueTemplate)}\`${redacted ? '（機密欄。secret の変数の値を再生の開始時に与えて入力する。値は保存・出力していない）' : ''}`);
+  else if (st.kind === 'prefill') L.push('  - 値: 入力済みの値をそのまま使う（書き込まない。空なら人の操作を待つ）');
   if (r?.selector) L.push(`  - 人が指定したセレクター（${r.selector.language}）: \`${md(r.selector.selector)}\`（安定性は未検証）`);
   L.push(`  - 操作後の待機条件: ${md(waitLabel(r?.wait))}`);
   if (r?.onFail) L.push(`  - 失敗時: ${r.onFail === 'continue' ? '続行' : '停止'}`);
@@ -519,7 +521,7 @@ function scenarioMd(c: MdCtx): string {
     }
     const a = st.annotation;
     const stepLevel = path.length ? Math.min(3 + path.length, 6) : 4;
-    L.push(`${'#'.repeat(stepLevel)} 手順 ${st.seq} — ${md(stepSummary(st))}`, '', `- ステップID: \`${st.id}\` / 種別: ${KIND_LABEL[st.kind]}`, `- 操作を観測した時刻: ${st.operationAt}${st.operationEndAt ? `（最終編集 ${st.operationEndAt}）` : ''}`, `- ページ: ${st.page.url}${st.frame.isTop ? '' : `（フレーム内: ${st.frame.url}）`}`);
+    L.push(`${'#'.repeat(stepLevel)} 手順 ${st.seq} — ${md(stepSummary(st))}`, '', `- ステップID: \`${st.id}\` / 種別: ${KIND_LABEL[st.kind]}`, st.kind === 'prefill' ? `- 入力欄に値が入っていることを観測した時刻（人の操作ではない。値が入った時刻ではない）: ${st.operationAt}` : `- 操作を観測した時刻: ${st.operationAt}${st.operationEndAt ? `（最終編集 ${st.operationEndAt}）` : ''}`, `- ページ: ${st.page.url}${st.frame.isTop ? '' : `（フレーム内: ${st.frame.url}）`}`);
     if (st.target) L.push(`- 対象要素: ${md(targetLabel(st))}（詳細: \`${rec.artifacts.element.path}\`）`);
     if (st.value) L.push(`- 記録時の入力・選択（サンプル）: ${md(valueLabel(st)) || '（空）'}${st.value.usedIme ? '（IME入力あり）' : ''}`);
     L.push(`- 目的: ${or(a.purpose)}`);

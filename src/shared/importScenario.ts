@@ -353,6 +353,7 @@ export function parseExportZip(bytes: Uint8Array): ParsedExport {
       includeInExport: true,
       replay: obj(rec.replay) ? clone(rec.replay) : undefined,
       order: typeof rec.order === 'number' ? rec.order : undefined,
+      ...(obj(rec.prefill) ? { prefill: { autofill: obj(rec.prefill)!.autofill === true } } : {}),
     };
 
     // グループ

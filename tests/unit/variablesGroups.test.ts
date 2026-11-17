@@ -1,12 +1,22 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { collectUsedVariables, extractVariableNames, resolveTemplate, sanitizeScenarioForSave, templateProblems, validateVariableName, validateVariables, effectiveVariableValues } from '../../src/shared/variables';
+import { collectUsedVariables, extractVariableNames, isSecretOnlyTemplate, resolveTemplate, sanitizeScenarioForSave, templateProblems, validateVariableName, validateVariables, effectiveVariableValues } from '../../src/shared/variables';
 import { createGroup, flattenGroupTree, groupPath, groupPathNames, moveGroup, removeGroup, renameGroup, validateGroupParent, validateGroups } from '../../src/shared/groups';
 import { buildExport } from '../../src/shared/export';
 import { emptyAnnotation, type StepGroup } from '../../src/shared/types';
 import { mkArtifacts, mkProject, mkScenario, mkStep, renderStub } from './fixtures';
 
 describe('変数と値テンプレート', () => {
+  it('isSecretOnlyTemplate は {{secret 変数}} だけでできたテンプレートだけを許す', () => {
+    expect(isSecretOnlyTemplate('{{pw}}', ['pw'])).toBe(true);
+    expect(isSecretOnlyTemplate('{{ pw }}{{pin}}', ['pw', 'pin'])).toBe(true);
+    expect(isSecretOnlyTemplate('x{{pw}}', ['pw'])).toBe(false);
+    expect(isSecretOnlyTemplate(' {{pw}}', ['pw'])).toBe(false);
+    expect(isSecretOnlyTemplate('{{code}}', ['pw'])).toBe(false);
+    expect(isSecretOnlyTemplate('', ['pw'])).toBe(false);
+    expect(isSecretOnlyTemplate(undefined, ['pw'])).toBe(false);
+  });
+
   it('テンプレートから有効な変数名を初出順・重複なしで取り出す', () => {
     expect(extractVariableNames('{{氏名}} / {{ 工程コード }} / {{氏名}} / {{a b}} / {{}}')).toEqual(['氏名', '工程コード']);
     expect(extractVariableNames(undefined)).toEqual([]);

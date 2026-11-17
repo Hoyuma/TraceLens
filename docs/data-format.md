@@ -87,7 +87,13 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | `replay` (v2) | 再生・編集の設定（下表）。記録された事実（`target` `value` など）は変えずに別に持つ |
 | `importedFrom` (v2) | 取り込み元（`source`: scenario / export-zip、元のシナリオ ID・名前、元の `stepId` `seq` `operationAt` `operationEndAt` `humanConfirmedAt`、取り込んだ時刻） |
 
-`kind` には v2 で `wait`（人が追加した、待機条件だけの手順）が加わりました。
+`kind` には v2 で `wait`（人が追加した、待機条件だけの手順）と `prefill`（入力済みの値）が加わりました。
+
+`prefill` は人の操作ではありません。人の操作の直前に、入力欄に（人が入力していないのに）値が入っていることを観測した記録です（ブラウザの自動入力・入力内容の復元・ページのスクリプトなど。値が入った経緯と時刻は記録していません）。`operationAt` は値が入っていることを観測した時刻です。`target` と `value` を持ち、機密欄は `value.kind: 'redacted'`（値なし）です。`screenshot` と `dom` は `not-applicable`（直後の操作の手順で保存します）。`limitations` に `prefill`（と、自動入力の表示があった場合は `browser-autofill`）が入ります。
+
+| 項目 | 内容 |
+|---|---|
+| `prefill` (v2) | `kind: 'prefill'` の手順だけ。`{ autofill: boolean }`。`autofill` は観測した時点で自動入力の表示（`:autofill` / `:-webkit-autofill`）に一致したか。一致しなくても自動入力でないとは限らない |
 
 #### 追加・取り込みした手順の番号と時刻
 
@@ -121,6 +127,9 @@ WaitCondition: `kind` = `none` / `element-present` / `element-absent`（`value` 
 - 再生計画（`buildReplayPlan`）は、表示・再生順のうち `replay.skip` でない手順から作ります。`includeInExport` とは独立です。
 - 手順の種別ごとの動作: click / input / select / check / key はそのまま、`session-start` は記録開始時の URL へ移動、`reload` は再読み込み。`navigation` / `spa-navigation` は計画の先頭（または直前が操作でない場合）なら移動、直前がクリックなどの操作なら「その操作の結果として起きる遷移」として URL の一致を待ちます（同じ遷移を二重に起こさない）。操作の後に遷移が続く場合（リダイレクト・フォームの自動送信）は、連鎖のすべてを待機にし、途中の URL を直接開きません。途中の遷移の待機条件は「この遷移先、または同じ連鎖の後続の遷移先」の URL（origin + path、`isRegex: true` の正規表現）です。`wait` は待機だけ。`notice` `manual-capture` `element-note` `session-end` は再生対象外（理由つきで計画に残り、結果は skipped）。
 - 機密欄（`value.kind: 'redacted'`）とファイル選択は自動で入力せず `manual`（人が操作して続行）にします。manual の手順は値を一切持ちません。対象要素のセレクターが無い操作も manual です。
+- 例外として、機密欄の `input` に `replay.valueTemplate` が secret の変数だけ（`{{名前}}` 以外の文字なし）で指定されている場合は `input`（`sensitiveField: true`）にし、再生の開始時に与えた値を書き込みます。secret の変数以外を含む場合は、開始前の確認（`preflight.sensitiveTemplates`）で開始しません。
+- `prefill` は既定で `keep-value`（入力済みの値をそのまま使う。値を書き込まず、入力欄に値が入っていることだけを上限時間まで確かめ、空なら manual で人の操作を待つ。待機条件の既定は「待機しない」）。`replay.valueTemplate` があれば `input` です（機密欄なら上と同じ制約）。
+- クリック・キー操作の前に、同じフォーム（または対象要素の中）に自動入力の表示があるのに値がページに渡っていない欄があれば、上限時間まで待ち、渡らなければ操作せずに失敗にします（`acted: 'no'`）。
 - セレクターは、人の指定 → 記録時の一致が 1 件で suspect でない候補 → 一致 1 件で suspect → その他、の順に試します（同順位は記録の順）。再生時に一致が 1 件のものだけを使う前提です。
 - 実行前の確認（`preflight`）で、値が決まらない変数（実行時入力が必要な secret の変数を含む）、manual の手順、再生対象外の手順を洗い出します。
 

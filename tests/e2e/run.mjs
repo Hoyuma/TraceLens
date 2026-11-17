@@ -232,6 +232,7 @@ try {
   const afterSw = db.steps.slice(n1);
   check('C02', `Service Worker 停止後も記録が継続し、既存の記録も残る（SW停止を${swStopped ? '確認' : '確認できず'}）`, swStopped && afterSw.some((s) => s.kind === 'input' && s.value?.text === '2') && db.steps.length > n1 && db.steps[0].kind === 'session-start', kinds(afterSw).join(','));
   check('C03', 'Enter キーが、直前の入力の確定後にキー操作として記録される', JSON.stringify(kinds(afterSw)) === JSON.stringify(['input', 'key']) && afterSw[1].key?.key === 'Enter', kinds(afterSw).join(','));
+  check('C04', '一時停止中に人が入力した値は、再開後も「入力済みの値」として記録されない', !JSON.stringify(db.steps).includes('paused-typing') && !afterSw.some((s) => s.kind === 'prefill'), kinds(afterSw).join(','));
   sw = await getSw(context);
 
   // --- 8. 必須入力エラー（2行目の未入力） ---
@@ -711,6 +712,70 @@ try {
   await fl.evaluate(() => localStorage.removeItem('mock.extraFrame')).catch(() => {});
   await fl.close().catch(() => {});
   if (donePage) await donePage.close().catch(() => {});
+
+  // --- 20c. 入力済みの値（自動入力の代わりにスクリプトが入れた値）の記録と再生 ---
+  const PREFILL_PW = 'Prefilled#Pw-2604';
+  const SECRET_PW = 'Var!Secret-5519';
+  const preSc = 'scn_e2eprefill';
+  await idbPut('scenarios', [{ schemaVersion: 2, id: preSc, projectId, name: '入力済みの値', purpose: '', preconditions: '', expectedResult: '', openQuestions: '', createdAt: nowIso, updatedAt: nowIso, sessions: [], groups: [], replacementRules: [], variables: [] }]);
+  const pre = await context.newPage();
+  await pre.goto(`${BASE}/prefill-login.html`);
+  await pre.evaluate(() => localStorage.removeItem('mock.noPrefill'));
+  await pre.waitForFunction(() => document.querySelector('#password').value !== '');
+  const preTabId = await sw.evaluate(async () => (await chrome.tabs.query({})).find((t) => t.url?.includes('prefill-login.html')).id);
+  const stP = await send({ t: 'ui:start', scenarioId: preSc, tabId: preTabId });
+  await sleep(1500);
+  await pre.bringToFront();
+  await pre.click('#login');
+  await sleep(1200);
+  await send({ t: 'ui:stop' });
+  await sleep(800);
+  db = await dump(review);
+  const psteps = db.steps.filter((s) => s.scenarioId === preSc).sort((a, b) => a.seq - b.seq);
+  const preUser = psteps.find((s) => s.kind === 'prefill' && s.target?.id === 'userId');
+  const prePw = psteps.find((s) => s.kind === 'prefill' && s.target?.id === 'password');
+  check('P30', '人が入力していない入力済みの値を、操作の直前に「入力済みの値」の手順として記録する（人の操作とは別の種別、パスワードは値を保存しない）',
+    stP?.ok && JSON.stringify(kinds(psteps)) === JSON.stringify(['session-start', 'prefill', 'prefill', 'click', 'session-end']) && preUser?.value?.text === 'U-PREFILLED' && prePw?.value?.redacted === true && prePw.value.text === undefined && preUser.screenshot.status === 'not-applicable' && preUser.dom.status === 'not-applicable' && preUser.limitations.some((l) => l.code === 'prefill'),
+    JSON.stringify(psteps.map((s) => [s.kind, s.target?.id, s.value, s.dom.status])));
+  check('P31', '入力済みのパスワードの値が保存データのどこにも無い', !JSON.stringify(db).includes(PREFILL_PW), '');
+
+  // (1) 既定: 入力済みの値をそのまま使う（ページが値を入れる）
+  const rP1 = await send({ t: 'ui:replay-start', scenarioId: preSc, mode: 'all', variableValues: {} });
+  await waitReplay((r) => r === null || r?.waitReason, 30000);
+  const p1state = (await send({ t: 'ui:replay-state' })).replay;
+  if (p1state) await send({ t: 'ui:replay-stop' });
+  let prun = (await replayRuns(preSc)).at(-1);
+  const pres = (id) => prun.results.find((x) => x.stepId === id);
+  let pp = findPage(/prefill-login\.html/, [pre]);
+  const p1text = pp ? await pp.locator('#result').textContent() : null;
+  check('P32', '入力済みの値は既定でそのまま使い（書き込まない）、最後まで実行する', rP1?.ok && prun.status === 'completed' && pres(preUser.id)?.status === 'ok' && pres(prePw.id)?.status === 'ok' && p1text === `送信内容: user=U-PREFILLED / pw-length=${PREFILL_PW.length}`,
+    JSON.stringify({ ok: rP1?.ok, msg: rP1?.message, status: prun.status, reason: prun.reason, results: prun.results.map((x) => [x.status, x.reason ?? '']), p1text }));
+  if (pp) await pp.close().catch(() => {});
+
+  // (2) 自動入力されない場合: ユーザコードは空なので人の操作を待ち、パスワードは secret の変数を入力する
+  await pre.evaluate(() => localStorage.setItem('mock.noPrefill', '1'));
+  await idbPut('scenarios', [{ ...(db.scenarios.find((s) => s.id === preSc)), variables: [{ id: 'var_pw', name: 'pw', secret: true }] }]);
+  await idbPut('steps', [{ ...prePw, replay: { valueTemplate: '{{pw}}' } }]);
+  const badStart = await send({ t: 'ui:replay-start', scenarioId: preSc, mode: 'all', variableValues: {} });
+  const rP2 = await send({ t: 'ui:replay-start', scenarioId: preSc, mode: 'all', variableValues: { pw: SECRET_PW } });
+  const mP = await waitReplay((r) => r?.waitReason?.code === 'manual-step' || r === null, 30000);
+  pp = findPage(/prefill-login\.html/, [pre]);
+  const waitedOnUser = mP?.waitReason?.stepId === preUser.id && /空/.test(mP.waitReason.message);
+  if (pp) await pp.fill('#userId', 'U-BY-HAND');
+  if (mP?.waitReason?.code === 'manual-step') await send({ t: 'ui:replay-continue-manual', stepId: mP.waitReason.stepId });
+  await waitReplay((r) => r === null || r?.waitReason?.code === 'failed-step', 30000);
+  const p2state = (await send({ t: 'ui:replay-state' })).replay;
+  if (p2state) await send({ t: 'ui:replay-stop' });
+  prun = (await replayRuns(preSc)).at(-1);
+  const p2text = pp ? await pp.locator('#result').textContent() : null;
+  check('P33', '入力済みの値が空なら人の操作を待ち、機密欄は secret の変数の値を入力して最後まで実行する（変数の値がなければ開始しない）',
+    badStart?.ok === false && rP2?.ok && waitedOnUser && prun.status === 'completed' && pres(prePw.id)?.status === 'ok' && p2text === `送信内容: user=U-BY-HAND / pw-length=${SECRET_PW.length}`,
+    JSON.stringify({ bad: badStart?.code, ok: rP2?.ok, msg: rP2?.message, wait: mP?.waitReason, status: prun.status, results: prun.results.map((x) => [x.status, x.reason ?? '']), p2text }));
+  db = await dump(review);
+  check('P34', 'secret の変数の値が保存データのどこにも無い', !JSON.stringify(db).includes(SECRET_PW) && !JSON.stringify(await replayRuns(preSc)).includes(SECRET_PW), '');
+  await pre.evaluate(() => localStorage.removeItem('mock.noPrefill')).catch(() => {});
+  await pre.close().catch(() => {});
+  if (pp) await pp.close().catch(() => {});
 
   // --- 20. ページ全体・要素単位の画像、操作前の画面の参照、新規タブへの切り替え（追加設定を有効にして記録） ---
   await review.evaluate(() => chrome.storage.local.set({ 'tracelens.settings': { beforeShot: true, followNewTab: true } }));
