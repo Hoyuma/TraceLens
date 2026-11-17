@@ -109,14 +109,47 @@ describe('1 手順の実行', () => {
     expect(clicked).toBe(0);
   });
 
-  it('クリックはポインター・マウスのイベント列と click を送り、イベントは isTrusted=false', async () => {
+  it('クリックはホバー・ポインター・マウスのイベント列と click を送り、イベントは isTrusted=false', async () => {
     document.body.innerHTML = '<button id="b">b</button>';
     const seen: string[] = []; let trusted: boolean | null = null;
-    for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) document.getElementById('b')!.addEventListener(t, (e) => { seen.push(t); if (t === 'click') trusted = e.isTrusted; });
+    const types = ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    for (const t of types) document.getElementById('b')!.addEventListener(t, (e) => { seen.push(t); if (t === 'click') trusted = e.isTrusted; });
     const r = await executeAction(act('click', { selectors: [css('#b')] }), env());
     expect(r.status).toBe('ok');
-    expect(seen).toEqual(['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']);
+    expect(seen).toEqual(types);
     expect(trusted).toBe(false);
+  });
+
+  describe('座標の要素へのクリック（target が子孫であることを前提にするメニュー）', () => {
+    const orig = (document as any).elementFromPoint;
+    afterEach(() => { (document as any).elementFromPoint = orig; });
+    // jQuery UI 1.8 の autocomplete と同じ判定: mouseover で選択中の項目を決め、click は target が「.ui-menu-item a」の中のときだけ選択する
+    const menu = () => {
+      document.body.innerHTML = '<ul id="m"><li class="ui-menu-item" role="menuitem"><a id="a1">A</a></li><li class="ui-menu-item" role="menuitem"><a id="a2">振替伝票依頼</a></li></ul><p id="out"></p>';
+      let active: Element | null = null;
+      const m = document.getElementById('m')!;
+      m.addEventListener('mouseover', (e) => { const a = (e.target as Element).closest('.ui-menu-item a'); if (a) active = a; });
+      m.addEventListener('click', (e) => { if (!(e.target as Element).closest('.ui-menu-item a') || !active) return; document.getElementById('out')!.textContent = active.textContent; });
+    };
+    it('座標の要素が記録した要素の子孫なら、その要素にホバーとクリックを送る', async () => {
+      menu();
+      (document as any).elementFromPoint = () => document.getElementById('a2');
+      const r = await executeAction(act('click', { selectors: [css('#m > li:nth-of-type(2)')] }), env());
+      expect(r.status).toBe('ok');
+      expect(document.getElementById('out')!.textContent).toBe('振替伝票依頼');
+    });
+    it('座標の要素が記録した要素の外（覆われている）なら、その要素には送らず記録した要素へ送る', async () => {
+      menu();
+      document.body.insertAdjacentHTML('beforeend', '<div id="cover"></div>');
+      let coverClicks = 0;
+      document.getElementById('cover')!.addEventListener('click', () => coverClicks++);
+      let liClicks = 0;
+      document.querySelector('#m > li:nth-of-type(2)')!.addEventListener('click', (e) => { if (e.target === e.currentTarget) liClicks++; });
+      (document as any).elementFromPoint = () => document.getElementById('cover');
+      await executeAction(act('click', { selectors: [css('#m > li:nth-of-type(2)')] }), env());
+      expect(coverClicks).toBe(0);
+      expect(liClicks).toBe(1);
+    });
   });
 
   it('チェックは目標と異なるときだけクリックする', async () => {

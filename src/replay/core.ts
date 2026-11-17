@@ -105,24 +105,51 @@ function fire(el: Element, type: string, init: EventInit & Record<string, unknow
   return el.dispatchEvent(new C(type, { bubbles: true, cancelable: true, composed: true, ...init }));
 }
 
-/** クリックの前段（ポインター・マウスのイベント列）を送り、クリックの座標を返す */
-function pressSequence(el: Element): { clientX: number; clientY: number; button: number } {
+/**
+ * クリックの座標で一番手前にある要素を、イベントの送り先にする。
+ * 実際のクリックではイベントの target は記録した要素の子孫（li の中の a など）になり、
+ * 「target が li 内の a か」で判定するメニュー（jQuery UI の autocomplete 等）は、li 自体へのクリックを無視する
+ * （実在の業務サイトで確認）。座標の要素が記録した要素自身か子孫のときだけ採用し、
+ * 別の要素に覆われている場合は記録した要素へ送る（対応を確認できない要素を操作しない）。
+ */
+export function hitTarget(el: Element, x: number, y: number): Element {
+  try {
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const hit = typeof root.elementFromPoint === 'function' ? root.elementFromPoint(x, y) : null;
+    if (hit && hit !== el && el.contains(hit) && hit.tagName.toLowerCase() !== OVERLAY_TAG) return hit;
+  } catch { /* ignore */ }
+  return el;
+}
+
+/**
+ * クリックの前段（ホバーとポインター・マウスのイベント列）を送り、クリックの座標と送り先を返す。
+ * ホバー（mouseover 等）を送るのは、マウスオーバーで「選択中の項目」を決め、クリックではそれを確定するだけのメニューがあるため。
+ */
+function pressSequence(el: Element): { pos: { clientX: number; clientY: number; button: number }; target: Element } {
   try { (el as HTMLElement).scrollIntoView?.({ block: 'center', inline: 'center' }); } catch { /* ignore */ }
   const r = el.getBoundingClientRect();
   const pos = { clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0 };
-  fire(el, 'pointerdown', { ...pos, pointerType: 'mouse', isPrimary: true, buttons: 1 }, 'PointerEvent');
-  fire(el, 'mousedown', { ...pos, buttons: 1 }, 'MouseEvent');
+  const t = hitTarget(el, pos.clientX, pos.clientY);
+  const ptr = { pointerType: 'mouse', isPrimary: true };
+  fire(t, 'pointerover', { ...pos, ...ptr }, 'PointerEvent');
+  fire(t, 'pointerenter', { ...pos, ...ptr, bubbles: false, cancelable: false }, 'PointerEvent');
+  fire(t, 'mouseover', pos, 'MouseEvent');
+  fire(t, 'mouseenter', { ...pos, bubbles: false, cancelable: false }, 'MouseEvent');
+  fire(t, 'pointermove', { ...pos, ...ptr }, 'PointerEvent');
+  fire(t, 'mousemove', pos, 'MouseEvent');
+  fire(t, 'pointerdown', { ...pos, ...ptr, buttons: 1 }, 'PointerEvent');
+  fire(t, 'mousedown', { ...pos, buttons: 1 }, 'MouseEvent');
   try { (el as HTMLElement).focus?.({ preventScroll: true }); } catch { /* ignore */ }
-  fire(el, 'pointerup', { ...pos, pointerType: 'mouse', isPrimary: true }, 'PointerEvent');
-  fire(el, 'mouseup', pos, 'MouseEvent');
-  return pos;
+  fire(t, 'pointerup', { ...pos, ...ptr }, 'PointerEvent');
+  fire(t, 'mouseup', pos, 'MouseEvent');
+  return { pos, target: t };
 }
 
-/** ポインター・マウスのイベント列を送り、click() する。 */
+/** ホバー・ポインター・マウスのイベント列を送り、座標の要素（記録した要素か子孫）を click() する。 */
 export function clickElement(el: Element): void {
-  const pos = pressSequence(el);
-  if (typeof (el as HTMLElement).click === 'function') (el as HTMLElement).click();
-  else fire(el, 'click', { ...pos, detail: 1 }, 'MouseEvent');
+  const { pos, target } = pressSequence(el);
+  if (typeof (target as HTMLElement).click === 'function') (target as HTMLElement).click();
+  else fire(target, 'click', { ...pos, detail: 1 }, 'MouseEvent');
 }
 
 /**
@@ -404,9 +431,9 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
       case 'click':
         if (javascriptUrlLink(el)) {
           // javascript: URL は拡張側から実行するとブロックされるため、ページ側（main world）でクリックする
-          pressSequence(el);
+          const { target } = pressSequence(el);
           if (!env.mainWorldClick) { csp.stop(); return { status: 'failed', reason: 'javascript: URL のリンクは、ページ側でのクリックが使えないため実行できない', selectorUsed: sel(used), matchCount: 1, ...diagOf() }; }
-          const m = await env.mainWorldClick(el);
+          const m = await env.mainWorldClick(target);
           if (!m.ok) { csp.stop(); return { status: 'failed', reason: `javascript: URL のリンクを、ページ側でクリックできなかった: ${m.reason ?? '理由不明'}（クリックの前段のイベントは送った）`, selectorUsed: sel(used), matchCount: 1, ...diagOf() }; }
           note = 'javascript: URL のリンクのため、ページ側（main world）でクリックした';
         } else clickElement(el);
