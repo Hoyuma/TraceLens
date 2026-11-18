@@ -16,7 +16,7 @@ const WAIT_KIND_LABEL_EN: Record<WaitCondition['kind'], string> = {
 const KIND_LABEL_EN: Record<StepKind, string> = {
   'session-start': 'Recording started', click: 'Click', input: 'Input', select: 'Select', check: 'Check', key: 'Key',
   navigation: 'Navigation', reload: 'Reload', 'spa-navigation': 'URL change (SPA)', 'manual-capture': 'Screen capture',
-  'element-note': 'Element note', 'session-end': 'Recording ended', notice: 'Notice', wait: 'Wait',
+  'element-note': 'Element note', 'session-end': 'Recording ended', notice: 'Notice', wait: 'Wait', prefill: 'Pre-filled value',
 };
 
 /** 手順の種別名（UI 用。既定は日本語で KIND_LABEL と同じ） */
@@ -71,6 +71,10 @@ export function stepSummary(step: Step, lang: DescLang = 'ja'): string {
     case 'session-end': return en ? 'State at end of recording' : '記録終了時の状態';
     case 'manual-capture': return en ? 'Screen saved manually' : '手動で画面を保存';
     case 'wait': return `${en ? 'Wait' : '待機'}: ${waitLabel(step.replay?.wait, lang)}`;
+    case 'prefill': {
+      const af = step.prefill?.autofill ? (en ? ' (browser autofill shown)' : '（ブラウザの自動入力の表示あり）') : '';
+      return en ? `Value already in ${tl}: ${quote(valueLabel(step, lang), lang)}${af}` : `${tl} に入力済みの値: ${quote(valueLabel(step), lang)}${af}`;
+    }
   }
 }
 function quote(s: string, lang: DescLang) {

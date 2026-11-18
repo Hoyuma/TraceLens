@@ -3,9 +3,9 @@ import type { ActedState, PreflightResult, ReplayAction, ReplayMode, ReplaySelec
 import type { WaitCondition } from './types';
 import type { ChangeKind, RefShot } from './beforeShot';
 import type { TabRef } from './tabSwitch';
-import type { Annotation, ArtifactPhase, ElementInfo, FormStateEntry, FrameInfo, Limitation, Observation, PageInfo, ScreenshotMeta, Step, StepKind, ValueInfo, CaptureStatus } from './types';
+import type { Annotation, ArtifactPhase, ElementInfo, FormStateEntry, FrameInfo, Limitation, Observation, PageInfo, Rect, ScreenshotMeta, Step, StepKind, ValueInfo, CaptureStatus } from './types';
 
-export interface DomPayload { html: string; formState: FormStateEntry[]; truncated: boolean; phase: ArtifactPhase; capturedAt: string; frameUrl: string }
+export interface DomPayload { html: string; formState: FormStateEntry[]; truncated: boolean; phase: ArtifactPhase; capturedAt: string; frameUrl: string; /** (追加) 要素の位置（data-tracelens-box）を付けたときのトップのビューポート */ boxViewport?: { width: number; height: number; scrollX: number; scrollY: number } }
 export interface DomFailure { failed: true; reason: string }
 
 export interface StepDraft {
@@ -22,8 +22,12 @@ export interface StepDraft {
   elementCapture: CaptureStatus;
   limitations: Limitation[];
   annotation?: Annotation;
+  /** (追加) kind: 'prefill' の観測の内容 */
+  prefill?: Step['prefill'];
   /** 操作時点までに、このフレームで観測した最後の画面変化。null は観測なし、未指定は観測情報なし（操作前の画面の参照判定に使う） */
   observedChange?: { atMs: number; kind: ChangeKind } | null;
+  /** (追加) この操作に対応する押下。firstChangeAtMs: 押下したフレームで、押下以降に最初に観測した画面変化（null は観測なし） */
+  press?: { id: string; atMs: number; firstChangeAtMs: number | null };
 }
 
 export type ContentMsg =
@@ -32,7 +36,11 @@ export type ContentMsg =
   | { t: 'patch'; stepId: string; set?: Partial<Pick<Step, 'value' | 'operationEndAt' | 'page'>>; observations?: Observation[]; dom?: DomPayload | DomFailure }
   | { t: 'shot'; shots: { stepId: string; phase: ArtifactPhase; /** 取得方法。省略は表示領域 */ method?: 'visible' | 'element' }[]; timingNote?: string }
   /** (追加) 操作前の画面の参照判定用に、画面変化を観測したことを SW に知らせる（間引いて送る。内容は送らない） */
-  | { t: 'change'; atMs: number; kind: ChangeKind }
+  | { t: 'change'; atMs: number; kind: ChangeKind; /** (追加) 間引いた範囲で最初に観測した変化の時刻 */ firstAtMs?: number }
+  /** (追加) 押下（pointerdown）を観測した。SW はすぐに押下時の画面の取得を始める。rect はトップのビューポート基準 */
+  | { t: 'press'; pressId: string; atMs: number; rect: Rect | null; rectNote?: string; viewport?: PageInfo['viewport'] }
+  /** (追加) 押下以降に、押下したフレームで最初の画面変化を観測した（間引かずに送る） */
+  | { t: 'press-change'; pressId: string; atMs: number }
   | { t: 'shot-skip'; stepId: string; reasonCode: string; reason: string }
   | { t: 'picker-done'; cancelled: boolean; stepId?: string }
   | { t: 'frames-changed' };
@@ -47,6 +55,8 @@ export interface HelloReply {
   trackChanges?: boolean;
   announce: 'session-start' | 'navigation' | null;
   fromUrl?: string;
+  /** (追加) 記録中のセッションの ID。記録していなければ省略。入力済みの値の観測の範囲をセッションごとに分けるのに使う */
+  sessionId?: string;
 }
 
 export type ToContentMsg =
@@ -54,6 +64,8 @@ export type ToContentMsg =
   | { t: 'manual-capture' }
   | { t: 'finish' }
   | { t: 'shot-meta'; stepId: string }
+  /** (追加) 押下した要素の現在の矩形（トップのビューポート基準）と、トップのビューポート */
+  | { t: 'press-rect'; pressId: string }
   /** (追加) ページ全体の取得: 開始（manual-capture の手順を作り、ページ寸法を返す） */
   | { t: 'scan-begin' }
   | { t: 'scan-scroll'; y: number }
@@ -72,6 +84,7 @@ export interface ScanScrollReply { scrollY: number; pageHeight: number; docToken
 export interface ScanEndReply { interfered: boolean; restored: boolean }
 
 export interface ShotMetaReply { meta: ScreenshotMeta }
+export interface PressRectReply { rect: Rect | null; viewport?: PageInfo['viewport'] }
 export interface FinishReply { step: StepDraft; dom?: DomPayload | DomFailure }
 
 export interface ActiveSession {
@@ -95,6 +108,8 @@ export interface ActiveSession {
   pickerShot?: 'element';
   /** (追加) 開始時点の設定。操作前の画面の参照を作る */
   beforeShot?: boolean;
+  /** (追加) 開始時点の設定。押下時の画面を取得する（未設定は有効） */
+  pressShot?: boolean;
   /** (追加) 開始時点の設定。対象タブから開かれたタブへ記録対象を切り替える */
   followNewTab?: boolean;
   /** (追加) 切り替える前のタブ（直近が末尾）。戻る先 */
@@ -120,7 +135,7 @@ export interface UiReply { ok: boolean; code?: string; message?: string; session
 export const STATE_KEY = 'tracelens.activeSession';
 /** 記録の追加設定（chrome.storage.local）。いずれも既定は無効 */
 export const SETTINGS_KEY = 'tracelens.settings';
-export interface RecordSettings { beforeShot?: boolean; followNewTab?: boolean; /** 拡張 UI の表示言語（既定 ja）。記録・出力には影響しない */ lang?: 'ja' | 'en' }
+export interface RecordSettings { beforeShot?: boolean; /** 押下時の画面を取得する（未設定は有効） */ pressShot?: boolean; followNewTab?: boolean; /** 拡張 UI の表示言語（既定 ja）。記録・出力には影響しない */ lang?: 'ja' | 'en' }
 export const EVT_CHANGED = 'evt:changed';
 
 // ---- 再生 (v2) ----------------------------------------------------------------

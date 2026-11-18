@@ -5,12 +5,15 @@
 //  - 再生で起こすイベントは isTrusted=false。記録用スクリプトはこれを記録しない（原則 13）。
 //    信頼されたイベントだけに反応するページでは操作が効かないため、待機の時間切れの理由にその可能性を書く。
 //  - 機密欄（sensitive.ts の判定）には値を書き込まず manual を返す。入力値は結果・理由に書かない。
+//    例外は、値が secret の変数だけから作られた入力（allowSensitive）だけ。
+//  - ブラウザの自動入力がページに渡っていない欄（autofillPending）がある間は、関係するクリック・キー操作をしない
+//    （空のまま送信されるため）。人がページを操作すると値が渡る。
 //  - 待機の observed は「条件を観測できた」であって業務処理の完了ではない。
 import type { ReplaySelector, ResolvedReplayAction, WaitOutcome } from '../shared/replay';
 import { DEFAULT_QUIET_MAX_MS, DEFAULT_QUIET_MS } from '../shared/replay';
 import type { ReplayRunReply } from '../shared/messages';
 import type { WaitCondition } from '../shared/types';
-import { isSensitiveField, markSensitiveFields } from '../shared/sensitive';
+import { autofillPending, fieldHasValue, isSensitiveField, markSensitiveFields } from '../shared/sensitive';
 
 export const OVERLAY_TAG = 'tracelens-replay-overlay';
 const POLL_MS = 100;
@@ -348,7 +351,23 @@ function watchExtensionCsp(doc: Document): { stop(): string | null } {
   return { stop() { try { doc.removeEventListener('securitypolicyviolation', on, true); } catch { /* ignore */ } return hit; } };
 }
 
-const OPERATIONS = new Set(['click', 'input', 'select', 'check', 'key']);
+const OPERATIONS = new Set(['click', 'input', 'select', 'check', 'key', 'keep-value']);
+
+/** 自動入力がページに渡っていない欄があるときの理由（値は含めない） */
+export const AUTOFILL_PENDING_REASON = 'ブラウザの自動入力の表示があるが、値がページに渡っていない入力欄がある（ブラウザは、人がページを操作するまで自動入力の値を渡さないことがある。再生のイベントはこの操作にならない）。このまま操作すると空の値で送信されるおそれがあるため、操作していない。自動入力された入力欄を一度クリックしてから「再試行」してください（または、その欄に値テンプレート・secret の変数を指定してください）';
+
+/** 操作の対象に関係する入力欄（同じフォーム・対象の中）のうち、自動入力がページに渡っていないもの */
+export function pendingAutofillFields(el: Element): Element[] {
+  const set = new Set<Element>();
+  const add = (list: Iterable<Element> | ArrayLike<Element> | null | undefined) => { if (list) for (const x of Array.from(list as ArrayLike<Element>)) set.add(x); };
+  const form = (el.closest('form') as HTMLFormElement | null) ?? ((el as HTMLInputElement).form ?? null);
+  if (form) add(form.elements as unknown as ArrayLike<Element>);
+  try { add(el.querySelectorAll('input,textarea')); } catch { /* ignore */ }
+  return [...set].filter((x) => { const tag = x.tagName.toLowerCase(); return (tag === 'input' || tag === 'textarea') && autofillPending(x); });
+}
+
+export const KEEP_VALUE_EMPTY_REASON = '入力欄が空。人が値を入力して「操作完了」で続行してください（毎回同じ値でよければ、再生設定で値テンプレート・変数を指定できる）';
+export const KEEP_VALUE_AUTOFILL_REASON = 'ブラウザの自動入力の表示はあるが、値がページに渡っていない（人がページを操作するまで渡さないことがある）。自動入力された入力欄を一度クリックして値が入ったことを確かめてから「操作完了」で続行してください';
 
 /** 機密欄の判定（記録時の印付けと同じ判定を使う） */
 function sensitive(el: Element): boolean {
@@ -361,6 +380,7 @@ function readiness(a: ResolvedReplayAction, el: Element): { ok: true; options?: 
   const na = notActionable(el);
   if (na && a.kind !== 'key') return { ok: false, reason: na };
   const tag = el.tagName.toLowerCase();
+  if (a.kind === 'keep-value' && !isTextInput(el)) return { ok: false, reason: `入力欄ではない（${tag}）`, fatal: true };
   if (a.kind === 'input') {
     if (!isTextInput(el) && !(el as HTMLElement).isContentEditable) return { ok: false, reason: `入力できない要素（${tag}）`, fatal: true };
     if (isTextInput(el) && el.readOnly) return { ok: false, reason: '対象要素が読み取り専用（readonly）' };
@@ -405,7 +425,7 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
       const f = findTarget(env.doc, a);
       attempts = f.attempts;
       if (f.ok) {
-        if ((a.kind === 'input' || a.kind === 'select' || a.kind === 'check') && sensitive(f.el)) {
+        if ((a.kind === 'input' || a.kind === 'select' || a.kind === 'check') && sensitive(f.el) && !(a.kind === 'input' && a.allowSensitive)) {
           return { status: 'manual', reason: '機密欄のため自動では操作しない。人が操作して続行する', selectorUsed: sel(f.selector), matchCount: 1, ...diagOf() };
         }
         const r = readiness(a, f.el);
@@ -421,6 +441,32 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
   }
   if (!el) return { status: 'failed', reason: 'キー操作の対象がない' };
   if (a.kind === 'input' && a.text === undefined) return { status: 'failed', reason: '入力する値がない' };
+
+  if (a.kind === 'keep-value') {
+    // 入力済みの値をそのまま使う: 値が入るのを上限時間まで待つ（書き込まない・値の内容は見ない）
+    for (;;) {
+      if (fieldHasValue(el)) {
+        const d = diagOf();
+        const wo = a.wait.kind === 'none' ? { kind: 'none' as const, status: 'not-applicable' as const } : await waitFor(a.wait, env, Math.max(deadline, now() + MIN_WAIT_AFTER_ACTION_MS), env.quietMaxMs);
+        const rep = { ...waitReply(wo, false), ...d, selectorUsed: sel(used), matchCount: 1 };
+        if (rep.status === 'ok') rep.reason = '入力済みの値をそのまま使った（値の内容は確認していない）';
+        return rep;
+      }
+      if (now() >= deadline) break;
+      await sleep(POLL_MS);
+    }
+    return { status: 'manual', reason: autofillPending(el) ? KEEP_VALUE_AUTOFILL_REASON : KEEP_VALUE_EMPTY_REASON, selectorUsed: sel(used), matchCount: 1, ...diagOf() };
+  }
+
+  if (a.kind === 'click' || a.kind === 'key') {
+    // 自動入力がページに渡っていない欄がある間は操作しない（空の値で送信されるのを避ける）。人がページを操作すれば渡る
+    for (;;) {
+      const pend = pendingAutofillFields(el);
+      if (!pend.length) break;
+      if (now() >= deadline) return { status: 'failed', reason: `${AUTOFILL_PENDING_REASON}（該当: ${pend.length} 欄）`, selectorUsed: sel(used), matchCount: used ? 1 : undefined, ...diagOf() };
+      await sleep(POLL_MS);
+    }
+  }
 
   if (env.beforeAct && !(await env.beforeAct({ selector: used }))) return { status: 'failed', reason: '再生の制御側で取り消されたため操作していない' };
 
@@ -439,6 +485,7 @@ export async function executeAction(a: ResolvedReplayAction, env: ExecEnv): Prom
         } else clickElement(el);
         break;
       case 'input':
+        if (a.allowSensitive && sensitive(el)) note = '機密欄に、secret の変数の値を入力した（値は記録していない）';
         if (isTextInput(el)) setNativeValue(el, a.text!);
         else { setEditableText(el as HTMLElement, a.text!); note = 'contenteditable は中身のテキストを置き換えた（リッチエディタ独自の内部状態には反映されない可能性がある）'; }
         break;

@@ -5,12 +5,13 @@
 import { SCHEMA_VERSION, emptyAnnotation, newId, type Artifact, type ArtifactPhase, type CaptureInfo, type EnvironmentInfo, type ScreenshotMeta, type Step, type StepKind } from '../shared/types';
 import { FULL_PAGE_LIMITS, cropForElement, planScroll, sameRect, type ScannedFrame } from '../shared/capture';
 import { decideBeforeScreenshot } from '../shared/beforeShot';
+import { decidePressShot } from '../shared/pressShot';
 import { applySwitch, decideOnCreated, decideOnRemoved, type TabRef, type TabSwitchState } from '../shared/tabSwitch';
 import { composeFullPage, cropBlob, imageSize } from './imageOps';
 import { addStep, getScenario, getStep, listScenarios, listSteps, patchScenario, patchStep, putArtifact } from '../shared/db';
 import { initReplay, isReplayActive, onReplayPage, onReplayUi } from './replay';
 import type { ReplayPageMsg, ReplayUiMsg } from '../shared/messages';
-import { EVT_CHANGED, SETTINGS_KEY, STATE_KEY, type RecordSettings, type ScanBeginReply, type ScanEndReply, type ScanScrollReply, type ActiveSession, type ContentMsg, type DomFailure, type DomPayload, type FinishReply, type HelloReply, type ShotMetaReply, type StepDraft, type UiMsg, type UiReply } from '../shared/messages';
+import { EVT_CHANGED, SETTINGS_KEY, STATE_KEY, type RecordSettings, type ScanBeginReply, type ScanEndReply, type ScanScrollReply, type ActiveSession, type ContentMsg, type DomFailure, type DomPayload, type FinishReply, type HelloReply, type PressRectReply, type ShotMetaReply, type StepDraft, type UiMsg, type UiReply } from '../shared/messages';
 
 const LAST_ENDED_KEY = 'tracelens.lastEnded';
 const CAPTURE_MIN_INTERVAL_MS = 600; // captureVisibleTab は毎秒2回まで (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND)
@@ -58,13 +59,13 @@ const INJECT_GUIDE: Record<string, string> = {
 };
 
 // ---- ステップ保存 -----------------------------------------------------------
-const NO_SHOT: StepKind[] = ['notice'];
+const NO_SHOT: StepKind[] = ['notice', 'prefill'];
 const BEFORE_KINDS = new Set<StepKind>(['click', 'input', 'select', 'check', 'key']);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function storeDom(step: Step, dom: DomPayload | DomFailure | undefined): Promise<void> {
   if (!dom) return;
   if ('failed' in dom) { step.dom = { status: 'failed', reasonCode: 'serialize-error', reason: dom.reason }; return; }
-  const a: Artifact = { id: `dom_${step.id}`, scenarioId: step.scenarioId, stepId: step.id, type: 'dom', capturedAt: dom.capturedAt, phase: dom.phase, includeInExport: true, html: dom.html, formState: dom.formState, truncated: dom.truncated, frameUrl: dom.frameUrl };
+  const a: Artifact = { id: `dom_${step.id}`, scenarioId: step.scenarioId, stepId: step.id, type: 'dom', capturedAt: dom.capturedAt, phase: dom.phase, includeInExport: true, html: dom.html, formState: dom.formState, truncated: dom.truncated, frameUrl: dom.frameUrl, ...(dom.boxViewport ? { boxViewport: dom.boxViewport } : {}) };
   await putArtifact(a);
   step.dom = { status: 'captured', artifactId: a.id };
   if (dom.truncated) step.limitations.push({ code: 'dom-truncated', message: 'DOMがサイズ上限を超えたため、後半を省略して保存した' });
@@ -73,11 +74,12 @@ async function storeStep(s: ActiveSession, draft: StepDraft, dom?: DomPayload | 
   const step: Step = {
     schemaVersion: SCHEMA_VERSION, id: draft.id, scenarioId: s.scenarioId, sessionId: s.sessionId, seq: s.nextSeq++,
     kind: draft.kind, operationAt: draft.operationAt, operationEndAt: draft.operationEndAt, page: draft.page, frame: draft.frame,
-    target: draft.target, value: draft.value, key: draft.key, navigation: draft.navigation,
+    target: draft.target, value: draft.value, key: draft.key, navigation: draft.navigation, ...(draft.prefill ? { prefill: draft.prefill } : {}),
     observations: [], screenshot: NO_SHOT.includes(draft.kind) ? { status: 'not-applicable' } : { status: 'pending' },
     dom: { status: 'pending' }, elementCapture: draft.elementCapture, limitations: draft.limitations ?? [],
     annotation: draft.annotation ?? emptyAnnotation(), includeInExport: true, ...over,
   };
+  if (draft.press && s.pressShot !== false) step.pressScreenshot = { status: 'pending', pressAt: iso(draft.press.atMs) };
   if (s.beforeShot && BEFORE_KINDS.has(draft.kind)) {
     // 新しい画像は作らない。直前の観測で取得した画像以降に画面変化の観測がなければ、その画像を参照する
     const opMs = Date.parse(draft.operationAt);
@@ -92,6 +94,7 @@ async function storeStep(s: ActiveSession, draft: StepDraft, dom?: DomPayload | 
   await setS(s);
   await storeDom(step, dom);
   await addStep(step);
+  if (step.pressScreenshot && draft.press) void finishPress(step, draft.press, draft.frame.browserFrameId ?? 0).catch((e) => console.warn('[TraceLens] press', e));
   return step;
 }
 async function bgStep(s: ActiveSession, kind: StepKind, over: Partial<Step>): Promise<Step> {
@@ -105,9 +108,10 @@ async function bgStep(s: ActiveSession, kind: StepKind, over: Partial<Step>): Pr
 async function settlePending(scenarioId: string, sessionId: string, reason: string, beforeSeq = Infinity): Promise<void> {
   for (const st of await listSteps(scenarioId)) {
     if (st.sessionId !== sessionId || st.seq >= beforeSeq) continue;
-    if (st.screenshot.status !== 'pending' && st.dom.status !== 'pending') continue;
+    if (st.screenshot.status !== 'pending' && st.dom.status !== 'pending' && st.pressScreenshot?.status !== 'pending') continue;
     await patchStep(st.id, (x) => {
       if (x.screenshot.status === 'pending') x.screenshot = { status: 'skipped', reasonCode: 'not-captured', reason };
+      if (x.pressScreenshot?.status === 'pending') x.pressScreenshot = { ...x.pressScreenshot, status: 'skipped', reasonCode: 'not-captured', reason: reason.replace('画面', '押下時の画面') };
       if (x.dom.status === 'pending') x.dom = { status: 'failed', reasonCode: 'not-captured', reason: reason.replace('画面', 'DOM') };
     });
   }
@@ -115,6 +119,102 @@ async function settlePending(scenarioId: string, sessionId: string, reason: stri
 
 // ---- 画面取得 ---------------------------------------------------------------
 let lastCaptureAt = 0;
+/**
+ * captureVisibleTab の呼び出し枠を待って確保する（押下時の画面の取得と共有するため、確保は同期的に行う）。
+ * 戻った直後（同じマイクロタスクの続き）で captureVisibleTab を呼ぶこと。
+ */
+async function waitCaptureSlot(): Promise<void> {
+  for (;;) {
+    const w = lastCaptureAt + CAPTURE_MIN_INTERVAL_MS - Date.now();
+    if (w <= 0) { lastCaptureAt = Date.now(); return; }
+    await sleep(w);
+  }
+}
+const captureErr = (e: unknown) => {
+  const m = String((e as Error)?.message || e);
+  const perm = /permission|activeTab|all_urls/i.test(m);
+  return { reasonCode: perm ? 'no-permission' : 'capture-error', reason: perm ? `画面取得の権限がない（対象タブでツールバーの TraceLens アイコンをクリックすると再許可される）: ${m}` : `画面取得に失敗: ${m}` };
+};
+
+// ---- 押下時の画面 -------------------------------------------------------------
+// pointerdown の通知を受けたら、キューを通さずにすぐ取得を始める（クリックの処理で画面が変わる前の画像を残すため）。
+// 画像は手順と結びつくまでメモリにだけ置く（SW が停止したら失われ、手順には理由つきの未取得を残す）。
+type PressCapture = { ok: true; startedAtMs: number; endedAtMs: number; blob: Blob; sameDocument: boolean } | { ok: false; reasonCode: string; reason: string };
+interface PressEntry { id: string; tabId: number; epoch: number; sessionId: string; atMs: number; rect: import('../shared/types').Rect | null; rectNote?: string; viewport?: ScreenshotMeta['viewport']; firstChangeAtMs: number | null; result: Promise<PressCapture> }
+const presses = new Map<string, PressEntry>();
+const PRESS_KEEP_MS = 20000;
+function noteChangeForPresses(tabId: number, atMs: number) {
+  for (const e of presses.values()) {
+    if (e.tabId !== tabId) continue;
+    const at = Math.max(atMs, e.atMs);
+    if (at >= e.atMs && (e.firstChangeAtMs === null || at < e.firstChangeAtMs)) e.firstChangeAtMs = at;
+  }
+}
+async function startPress(msg: Extract<ContentMsg, { t: 'press' }>, sender: chrome.runtime.MessageSender): Promise<void> {
+  const s = await getS();
+  if (!s || s.status !== 'recording' || sender.tab?.id !== s.tabId || s.pressShot === false) return;
+  const capture = async (): Promise<PressCapture> => {
+    // 枠を待つと押下時の画面ではなくなるため、空いていなければ取得しない
+    if (lastCaptureAt + CAPTURE_MIN_INTERVAL_MS > Date.now()) return { ok: false, reasonCode: 'rate-limited', reason: '直前の画面取得から間がなく、取得回数の上限（毎秒 2 回）のため、押下時の画面を取得していない' };
+    lastCaptureAt = Date.now();
+    const startedAtMs = lastCaptureAt;
+    let dataUrl: string;
+    try { dataUrl = await chrome.tabs.captureVisibleTab(s.windowId, { format: 'png' }); } catch (e) { return { ok: false, ...captureErr(e) }; }
+    const endedAtMs = Date.now();
+    const tab = await chrome.tabs.get(s.tabId).catch(() => null);
+    const cur = await getS();
+    const sameDocument = !!tab && tab.active && tab.windowId === s.windowId && !!cur && cur.sessionId === s.sessionId && cur.docEpoch === s.docEpoch && cur.tabId === s.tabId;
+    const blob = await (await fetch(dataUrl)).blob();
+    return { ok: true, startedAtMs, endedAtMs, blob, sameDocument };
+  };
+  const e: PressEntry = { id: msg.pressId, tabId: s.tabId, epoch: s.docEpoch, sessionId: s.sessionId, atMs: msg.atMs, rect: msg.rect, rectNote: msg.rectNote, viewport: msg.viewport, firstChangeAtMs: null, result: capture() };
+  presses.set(e.id, e);
+  setTimeout(() => presses.delete(e.id), PRESS_KEEP_MS);
+}
+/** 手順に結びついた押下の画像を判定して保存する */
+async function finishPress(step: Step, p: NonNullable<StepDraft['press']>, frameId: number): Promise<void> {
+  const e = presses.get(p.id);
+  const cap = e ? await e.result : null;
+  await sleep(150); // 他のフレームからの画面変化の通知（最大 0.1 秒間引く）を待つ
+  presses.delete(p.id);
+  let rectAfter: import('../shared/types').Rect | null = null;
+  let viewport = e?.viewport;
+  if (e && cap?.ok) {
+    const r = (await chrome.tabs.sendMessage(e.tabId, { t: 'press-rect', pressId: p.id }, { frameId }).catch(() => null)) as PressRectReply | null;
+    rectAfter = r?.rect ?? null;
+    if (!viewport) {
+      const top = frameId === 0 ? r : (await chrome.tabs.sendMessage(e.tabId, { t: 'press-rect', pressId: '' }, { frameId: 0 }).catch(() => null)) as PressRectReply | null;
+      viewport = top?.viewport;
+    }
+  }
+  const changes = [e?.firstChangeAtMs ?? null, p.firstChangeAtMs].filter((x): x is number => x !== null);
+  const d = decidePressShot({
+    pressAtMs: p.atMs, operationAtMs: Date.parse(step.operationAt),
+    capture: cap ? (cap.ok ? { ok: true, startedAtMs: cap.startedAtMs, endedAtMs: cap.endedAtMs } : cap) : null,
+    firstChangeAtMs: changes.length ? Math.min(...changes) : null,
+    sameDocument: !!cap && (!cap.ok || cap.sameDocument),
+    rectAtPress: e?.rect ?? null, rectAfterCapture: rectAfter,
+  });
+  if (!d.keep || !cap || !cap.ok) {
+    const r = d.keep ? { reasonCode: 'press-lost', reason: '押下時の画面の取得情報が見つからない' } : d;
+    await patchStep(step.id, (x) => { if (x.pressScreenshot?.status === 'pending') x.pressScreenshot = { ...x.pressScreenshot, status: 'skipped', reasonCode: r.reasonCode, reason: r.reason }; });
+    notify();
+    return;
+  }
+  const capturedAt = iso(cap.endedAtMs);
+  const meta: ScreenshotMeta = {
+    url: step.page.url, viewport, targetRectAtCapture: d.highlight && viewport ? e!.rect : null,
+    targetRectNote: d.highlight && viewport ? '押下時に測った対象要素の位置（取得の完了後に測り直して一致を確認した）' : d.highlightNote ?? e?.rectNote ?? 'トップのビューポートの情報がないため、操作位置を強調しない',
+    timingNote: d.notes.join(' / '),
+  };
+  const a: Artifact = { id: `press_${step.id}`, scenarioId: step.scenarioId, stepId: step.id, type: 'screenshot', capturedAt, phase: 'at-press', includeInExport: true, blob: cap.blob, meta, masks: [] };
+  const cur = await getStep(step.id);
+  if (!cur || cur.pressScreenshot?.status !== 'pending') return; // 手順が削除された・記録終了で確定済み
+  await putArtifact(a);
+  await patchStep(step.id, (x) => { x.pressScreenshot = { status: 'captured', artifactId: a.id, pressAt: iso(p.atMs), captureStartedAt: iso(cap.startedAtMs), capturedAt, notes: d.notes }; });
+  notify();
+}
+
 let capChain: Promise<unknown> = Promise.resolve();
 type Shot = { stepId: string; phase: ArtifactPhase; method?: 'visible' | 'element' };
 function requestShots(shots: Shot[], epoch: number, final = false, timingNote?: string): Promise<void> {
@@ -141,7 +241,7 @@ async function getMeta(tabId: number, stepId: string): Promise<ScreenshotMeta> {
 }
 async function doShots(shots: Shot[], epoch: number, final: boolean, timingNote?: string): Promise<void> {
   const wait = lastCaptureAt + CAPTURE_MIN_INTERVAL_MS - Date.now();
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  if (wait > 0) await sleep(wait);
   const s = await getS();
   if (!s) return failShots(shots, 'not-recording', '記録が終了していたため画面を取得していない');
   if (s.status !== 'recording' && !final) return failShots(shots, 'paused', '一時停止中のため画面を取得していない');
@@ -154,14 +254,13 @@ async function doShots(shots: Shot[], epoch: number, final: boolean, timingNote?
   for (const sh of shots) metas.set(sh.stepId, { ...(await getMeta(s.tabId, sh.stepId)), ...(timingNote ? { timingNote } : {}) });
   // 要素選択の強調表示（TraceLens 自身のオーバーレイ）が画像に写らないよう、消えて描画されるのを待つ
   if (shots.some((x) => x.method === 'element')) await sleep(160);
-  lastCaptureAt = Date.now();
   let dataUrl: string;
   try {
+    await waitCaptureSlot(); // 押下時の画面の取得と枠を共有する
     dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
   } catch (e) {
-    const m = String((e as Error)?.message || e);
-    const perm = /permission|activeTab|all_urls/i.test(m);
-    return failShots(shots, perm ? 'no-permission' : 'capture-error', perm ? `画面取得の権限がない（対象タブでツールバーの TraceLens アイコンをクリックすると再許可される）: ${m}` : `画面取得に失敗: ${m}`);
+    const r = captureErr(e);
+    return failShots(shots, r.reasonCode, r.reason);
   }
   const capturedAt = iso();
   const tab2 = await chrome.tabs.get(s.tabId).catch(() => null);
@@ -237,7 +336,7 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
         s.lastUrl = msg.url; s.needsPermission = undefined; s.lastNoticeKey = undefined;
         await setS(s);
       }
-      return { recording: true, paused: s.status === 'paused', picker: s.picker, pickerMode: s.pickerShot === 'element' ? 'element' : 'note', trackChanges: !!s.beforeShot, announce, fromUrl } satisfies HelloReply;
+      return { recording: true, paused: s.status === 'paused', picker: s.picker, pickerMode: s.pickerShot === 'element' ? 'element' : 'note', trackChanges: !!s.beforeShot || s.pressShot !== false, announce, fromUrl, sessionId: s.sessionId } satisfies HelloReply;
     }
     case 'step': {
       if (!s || !mine || s.status !== 'recording') return { ok: false };
@@ -245,7 +344,8 @@ async function onContent(msg: ContentMsg, sender: chrome.runtime.MessageSender):
       d.frame.browserFrameId = sender.frameId;
       if (!d.frame.isTop && sender.tab?.url) d.page = { ...d.page, url: sender.tab.url, title: sender.tab.title ?? d.page.title };
       if (d.kind === 'spa-navigation' && d.navigation) s.lastUrl = d.navigation.toUrl;
-      await storeStep(s, d, msg.dom, d.kind === 'session-start' || d.kind === 'navigation' || d.kind === 'reload' ? {} : msg.dom ? {} : { dom: { status: 'failed', reasonCode: 'no-dom', reason: 'DOMが送信されなかった' } });
+      // 入力済みの値の観測は、直後の操作の手順で DOM を保存するため、この手順では DOM を取得しない
+      await storeStep(s, d, msg.dom, d.kind === 'prefill' ? { dom: { status: 'not-applicable' } } : d.kind === 'session-start' || d.kind === 'navigation' || d.kind === 'reload' ? {} : msg.dom ? {} : { dom: { status: 'failed', reasonCode: 'no-dom', reason: 'DOMが送信されなかった' } });
       notify();
       return { ok: true };
     }
@@ -355,9 +455,8 @@ async function runFullPage(tabId: number, begin: ScanBeginReply, epoch: number, 
     if ((fail = await check())) break;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) { fail = { code: 'tab-gone', reason: '対象タブが閉じられたため、取得を中止した' }; break; }
-    lastCaptureAt = Date.now();
     let url: string;
-    try { url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }); } catch (e) {
+    try { await waitCaptureSlot(); url = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }); } catch (e) {
       const m = String((e as Error)?.message || e);
       fail = { code: /permission|activeTab|all_urls/i.test(m) ? 'no-permission' : 'capture-error', reason: `画面取得に失敗: ${m}` }; break;
     }
@@ -425,7 +524,7 @@ async function onUi(msg: UiMsg): Promise<UiReply> {
       if (!tab || tab.id === undefined) return { ok: false, code: 'no-tab', message: '記録対象のタブが見つかりません。' };
       const steps = await listSteps(sc.id);
       const settings = ((await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY] as RecordSettings | undefined) ?? {};
-      const ns: ActiveSession = { scenarioId: sc.id, sessionId: newId('ses'), tabId: tab.id, windowId: tab.windowId, status: 'recording', startedAt: Date.now(), pausedAccumMs: 0, lastUrl: tab.url, awaitingStart: true, picker: false, beforeShot: !!settings?.beforeShot, followNewTab: !!settings?.followNewTab, tabStack: [], nextSeq: (steps.at(-1)?.seq ?? 0) + 1, docEpoch: 0 };
+      const ns: ActiveSession = { scenarioId: sc.id, sessionId: newId('ses'), tabId: tab.id, windowId: tab.windowId, status: 'recording', startedAt: Date.now(), pausedAccumMs: 0, lastUrl: tab.url, awaitingStart: true, picker: false, beforeShot: !!settings?.beforeShot, pressShot: settings?.pressShot !== false, followNewTab: !!settings?.followNewTab, tabStack: [], nextSeq: (steps.at(-1)?.seq ?? 0) + 1, docEpoch: 0 };
       await setS(ns);
       const r = await inject(tab.id);
       if (!r.ok) { await setS(null); return { ok: false, code: r.code, message: `${INJECT_GUIDE[r.code]}（詳細: ${r.message}）` }; }
@@ -484,6 +583,10 @@ chrome.runtime.onMessage.addListener((msg: ContentMsg | UiMsg | { t: string }, s
     enqueue(() => onReplayUi(msg as ReplayUiMsg)).then(sendResponse, (e) => sendResponse({ ok: false, message: String(e) }));
     return true;
   }
+  // 押下時の画面: 取得の開始を遅らせないよう、記録のキューを通さずに扱う
+  if (msg.t === 'press') { void startPress(msg as Extract<ContentMsg, { t: 'press' }>, sender); return; }
+  if (msg.t === 'press-change') { const m = msg as Extract<ContentMsg, { t: 'press-change' }>; const e = presses.get(m.pressId); if (e && e.tabId === sender.tab?.id && (e.firstChangeAtMs === null || m.atMs < e.firstChangeAtMs)) e.firstChangeAtMs = m.atMs; return; }
+  if (msg.t === 'change' && sender.tab?.id !== undefined) { const m = msg as Extract<ContentMsg, { t: 'change' }>; noteChangeForPresses(sender.tab.id, m.firstAtMs ?? m.atMs); }
   const isUi = msg.t.startsWith('ui:');
   if (isUi && sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // UI操作は拡張ページからのみ
   enqueue(async () => {

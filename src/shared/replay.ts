@@ -4,13 +4,17 @@
 // 方針:
 //  - 計画は orderedSteps（表示・再生順）から、replay.skip の手順を除いて作る。includeInExport とは独立
 //    （出力対象外にした手順も、skip でなければ再生する。出力と再生は目的が違うため）。
-//  - 機密欄（value.kind === 'redacted' / value.redacted）とファイル選択は自動入力せず manual にする。
+//  - 機密欄（value.kind === 'redacted' / value.redacted）とファイル選択は、既定では自動入力せず manual にする。
 //    manual の action は値を一切持たない（記録時点で値を保存していない）。
+//    機密欄は、人が値テンプレートを secret の変数だけ（{{変数}} 以外の文字を含まない）で指定した場合に限り、
+//    実行時に与えた値を書き込む（値は保存しない。判断 57）。
+//  - 入力済みの値（prefill）は、既定ではページ・ブラウザが入れた値をそのまま使い（keep-value）、空なら人の操作を待つ。
 //  - 待機は状態条件で行う。記録時の操作間隔（時刻差）は待機時間に使わない。
 //  - 結果の ok は「操作を実行し、待機条件を観測できた」という意味で、業務処理の完了を意味しない。
 import { orderedSteps } from './steps';
-import { extractVariableNames, resolveTemplate } from './variables';
-import type { FrameHop, ISO, Scenario, ScenarioVariable, SelectorCandidate, Step, StepKind, WaitCondition } from './types';
+import { extractVariableNames, isSecretOnlyTemplate, resolveTemplate } from './variables';
+import type { FrameHop, ISO, Scenario, ScenarioVariable, SelectorCandidate, Step, StepKind, UrlRewrite, WaitCondition } from './types';
+import { rewriteUrl } from './urlRewrite';
 import { stepSummary } from './describe';
 
 /** 1 手順あたりの既定の上限時間（対象要素の出現待ち + 操作 + 待機条件の観測） */
@@ -22,7 +26,11 @@ export const DEFAULT_QUIET_MAX_MS = 2_500;
 export const DEFAULT_WAIT: Readonly<WaitCondition> = Object.freeze({ kind: 'dom-quiet', quietMs: DEFAULT_QUIET_MS });
 export const DEFAULT_ON_FAIL: 'stop' | 'continue' = 'stop';
 
-export type ReplayActionKind = 'click' | 'input' | 'select' | 'check' | 'key' | 'navigate' | 'wait' | 'manual' | 'unsupported';
+/**
+ * keep-value: 入力済みの値をそのまま使う。対象の入力欄に値が入っていることだけを確かめ（値の内容は見ない）、
+ * 空なら人の操作を待つ（manual）。値は書き込まない。
+ */
+export type ReplayActionKind = 'click' | 'input' | 'select' | 'check' | 'key' | 'navigate' | 'wait' | 'manual' | 'keep-value' | 'unsupported';
 
 export interface ReplaySelector {
   language: 'css' | 'xpath';
@@ -56,8 +64,13 @@ export interface ReplayAction {
   frame: FrameHop[];
   frameUrl: string;
   shadowPath: { hostSelector: string; mode: 'open' }[];
-  /** input / select の値。テンプレートなら {{変数}} を含む。manual / 機密欄では持たない。 */
+  /** input / select の値。テンプレートなら {{変数}} を含む。manual / 機密欄（テンプレートの指定がない場合）では持たない。 */
   value?: ReplayValue;
+  /**
+   * 記録時に機密欄だった手順。値はテンプレート（secret の変数だけ）からしか作らない。
+   * テンプレートが secret の変数だけでできていなければ、実行前の確認（preflight）で開始を止める。
+   */
+  sensitiveField?: boolean;
   /** select: 記録時に選んだ option（テンプレート指定がない場合に使う） */
   selectOptions?: { value: string; label: string; index: number }[];
   /** check: 記録時の状態 */
@@ -81,8 +94,11 @@ export interface ReplayAction {
   unsupportedReason?: string;
 }
 
-/** 変数を解決した action（SW → 再生スクリプト）。text はテンプレートを解決した値か記録値。 */
-export type ResolvedReplayAction = Omit<ReplayAction, 'value'> & { text?: string };
+/**
+ * 変数を解決した action（SW → 再生スクリプト）。text はテンプレートを解決した値か記録値。
+ * allowSensitive: 値が secret の変数だけから作られた（機密欄に書き込んでよい）。
+ */
+export type ResolvedReplayAction = Omit<ReplayAction, 'value'> & { text?: string; allowSensitive?: boolean };
 
 /** 記録した再読み込みの再生方法（制限として UI・結果に出す） */
 export const RELOAD_AS_GET_NOTE = '記録した再読み込みは、フォームの再送信（重複登録）を避けるため、現在の URL へ GET で移動し直して再生する（ブラウザの再読み込みとは異なる。URL の # 以降は外す）';
@@ -116,6 +132,9 @@ function urlContainsValue(url: string): string {
 
 const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** 入力済みの値をそのまま使う手順の再生方法（UI・結果に出す） */
+export const KEEP_VALUE_NOTE = '入力済みの値をそのまま使う（値は書き込まない。入力欄に値が入っていることだけを確かめ、値の内容は確認しない）。空なら人の操作を待つ';
+
 /** 操作の結果として起きる遷移の連鎖（リダイレクト・自動送信を含む）の再生の仕方 */
 export const NAV_CHAIN_NOTE = '直前の操作の結果として起きる遷移（リダイレクト・フォームの自動送信を含む連続した遷移）のため、URL を直接開かず、遷移の観測で待つ。途中の画面は短時間で次へ進むことがあるため、同じ連鎖の後続の遷移先に達していても一致とみなす';
 
@@ -130,7 +149,9 @@ export function chainUrlWait(urls: readonly string[]): WaitCondition {
 }
 
 const isNav = (s: Step) => s.kind === 'navigation' || s.kind === 'spa-navigation';
-const navUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
+const rawNavUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
+/** 再生時の URL の置き換えを使った手順の注記 */
+export const URL_REWRITE_NOTE = '記録した URL を、シナリオの「URL の置き換え」で置き換えて再生した（記録は書き換えていない）';
 
 /**
  * 再生計画を作る（scenario に属する手順だけを使う）。範囲の ID が見つからない場合は Error を投げる。
@@ -144,7 +165,7 @@ const navUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
  *   連鎖の途中の URL を直接開くと、POST の本文や使い捨てのトークンが失われ、別の画面になるため
  *   （実際の業務サイトで、自動送信の画面とトークン付き URL を GET で開き直して後続の手順が失敗した）。
  */
-export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly Step[], opts: ReplayPlanOptions = {}): ReplayAction[] {
+export function buildReplayPlan(scenario: Pick<Scenario, 'id' | 'urlRewrites'>, steps: readonly Step[], opts: ReplayPlanOptions = {}): ReplayAction[] {
   const all = orderedSteps(steps.filter((s) => s.scenarioId === scenario.id));
   let list = all.filter((s) => !s.replay?.skip);
   if (opts.fromStepId || opts.toStepId) {
@@ -166,11 +187,15 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
     list = list.filter((s) => only.has(s.id));
   }
 
-  return list.map((s, index) => {
+  // 再生時の URL の置き換え（記録した URL は書き換えない）。置き換えた手順には注記を付ける
+  const used: { rule?: UrlRewrite } = {};
+  const rw = (u: string): string => { const x = rewriteUrl(u, scenario.urlRewrites); if (x.rule) used.rule ??= x.rule; return x.url; };
+  const navUrl = (s: Step) => rw(rawNavUrl(s));
+  const actionFor = (s: Step, index: number): ReplayAction => {
     const r = s.replay ?? {};
     const base: ReplayAction = {
       stepId: s.id, seq: s.seq, index, kind: 'unsupported', stepKind: s.kind, label: stepSummary(s),
-      selectors: rankSelectors(s), frame: s.frame.path, frameUrl: s.frame.url, shadowPath: s.target?.shadowPath ?? [],
+      selectors: rankSelectors(s), frame: s.frame.path, frameUrl: rw(s.frame.url), shadowPath: s.target?.shadowPath ?? [],
       wait: r.wait ?? { ...DEFAULT_WAIT }, onFail: r.onFail ?? DEFAULT_ON_FAIL, timeoutMs: r.timeoutMs && r.timeoutMs > 0 ? r.timeoutMs : DEFAULT_REPLAY_TIMEOUT_MS,
     };
     const prev = list[index - 1];
@@ -179,7 +204,10 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
     switch (s.kind) {
       case 'click': return needTarget({ ...base, kind: 'click' });
       case 'input': {
-        if (isRedacted(s)) return manual('機密欄のため値を保存していない。人が入力して続行する');
+        if (isRedacted(s)) {
+          if (r.valueTemplate === undefined) return manual('機密欄のため値を保存していない。人が入力して続行する');
+          return needTarget({ ...base, kind: 'input', value: { source: 'template', template: r.valueTemplate }, sensitiveField: true });
+        }
         if (s.value?.kind === 'files') return manual('ファイル選択は自動で行わない。人が選択して続行する');
         const value: ReplayValue = r.valueTemplate !== undefined ? { source: 'template', template: r.valueTemplate } : { source: 'recorded', text: s.value?.text ?? '' };
         return needTarget({ ...base, kind: 'input', value });
@@ -194,8 +222,8 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
         if (isRedacted(s)) return manual('機密欄のため状態を保存していない。人が操作して続行する');
         return needTarget({ ...base, kind: 'check', checked: !!s.value?.checked });
       case 'key': return { ...base, kind: 'key', key: s.key };
-      case 'session-start': return { ...base, kind: 'navigate', url: s.page.url };
-      case 'reload': return { ...base, kind: 'navigate', url: s.navigation?.toUrl ?? s.page.url, reload: true, note: RELOAD_AS_GET_NOTE };
+      case 'session-start': return { ...base, kind: 'navigate', url: rw(s.page.url) };
+      case 'reload': return { ...base, kind: 'navigate', url: rw(s.navigation?.toUrl ?? s.page.url), reload: true, note: RELOAD_AS_GET_NOTE };
       case 'navigation': case 'spa-navigation': {
         const url = navUrl(s);
         // 直前までさかのぼった遷移の連鎖の起点（遷移でない最初の手順）
@@ -213,8 +241,21 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
         return { ...base, kind: 'navigate', url };
       }
       case 'wait': return { ...base, kind: 'wait', wait: r.wait ?? { kind: 'none' } };
+      case 'prefill': {
+        // 入力済みの値: 値テンプレートの指定があれば書き込み、なければ入っている値をそのまま使う
+        if (r.valueTemplate !== undefined) return needTarget({ ...base, kind: 'input', value: { source: 'template', template: r.valueTemplate }, ...(isRedacted(s) ? { sensitiveField: true } : {}) });
+        return needTarget({ ...base, kind: 'keep-value', wait: r.wait ?? { kind: 'none' }, note: KEEP_VALUE_NOTE });
+      }
       default: return { ...base, kind: 'unsupported', unsupportedReason: UNSUPPORTED[s.kind] ?? '再生に対応していない種別' };
     }
+  };
+  return list.map((s, index) => {
+    used.rule = undefined;
+    const a = actionFor(s, index);
+    const rule = used.rule as UrlRewrite | undefined; // actionFor の中で設定される
+    if (!rule) return a;
+    const n = `${URL_REWRITE_NOTE}（${rule.from} → ${rule.to}）`;
+    return { ...a, note: a.note ? `${a.note} / ${n}` : n };
   });
 }
 
@@ -232,11 +273,19 @@ export interface PreflightResult {
   manualSteps: { stepId: string; seq: number; reason: string }[];
   /** 再生対象外（エンジンは skipped として残す） */
   unsupported: { stepId: string; seq: number; reason: string }[];
+  /**
+   * 機密欄の値テンプレートが secret の変数だけでできていない手順（開始できない）。
+   * 機密の値を、保存される値（テンプレートの文字・secret でない変数の既定値）から作らないため。
+   */
+  sensitiveTemplates: { stepId: string; seq: number; reason: string }[];
 }
+
+export const SENSITIVE_TEMPLATE_REASON = '機密欄の値テンプレートには、secret の変数だけ（{{変数名}} 以外の文字を含まない）を指定できる';
 
 /** 実行前の確認。provided の undefined は未入力、空文字は「空を指定」とみなす。secret は既定値を持たないので実行時入力が必要。 */
 export function preflight(plan: readonly ReplayAction[], variables: readonly ScenarioVariable[], provided: Readonly<Record<string, string | undefined>>): PreflightResult {
   const byName = new Map(variables.map((v) => [v.name, v]));
+  const secretNames = variables.filter((v) => v.secret).map((v) => v.name);
   const missing = new Map<string, { name: string; secret: boolean; defined: boolean; stepIds: string[] }>();
   for (const a of plan) {
     if (a.value?.source !== 'template') continue;
@@ -253,17 +302,26 @@ export function preflight(plan: readonly ReplayAction[], variables: readonly Sce
     missingVariables: [...missing.values()],
     manualSteps: plan.filter((a) => a.kind === 'manual').map((a) => ({ stepId: a.stepId, seq: a.seq, reason: a.manualReason ?? '' })),
     unsupported: plan.filter((a) => a.kind === 'unsupported').map((a) => ({ stepId: a.stepId, seq: a.seq, reason: a.unsupportedReason ?? '' })),
+    sensitiveTemplates: plan.filter((a) => a.sensitiveField && !(a.value?.source === 'template' && isSecretOnlyTemplate(a.value.template, secretNames)))
+      .map((a) => ({ stepId: a.stepId, seq: a.seq, reason: SENSITIVE_TEMPLATE_REASON })),
   };
 }
 
-/** action の値を解決する（SW が replay:run を送る直前に呼ぶ）。values は既定値を含めた実行時の値。 */
-export function resolveAction(action: ReplayAction, values: Readonly<Record<string, string | undefined>>): { ok: true; action: ResolvedReplayAction } | { ok: false; missing: string[] } {
+/**
+ * action の値を解決する（SW が replay:run を送る直前に呼ぶ）。values は既定値を含めた実行時の値。
+ * secretNames: secret の変数名。テンプレートが secret の変数だけでできていれば allowSensitive を付ける
+ * （ページ側は、これがない限り機密欄に値を書き込まない）。
+ * 記録時に機密欄だった手順（sensitiveField）で、テンプレートが secret の変数だけでない場合は解決しない（値を作らない）。
+ */
+export function resolveAction(action: ReplayAction, values: Readonly<Record<string, string | undefined>>, secretNames: readonly string[] = []): { ok: true; action: ResolvedReplayAction } | { ok: false; missing: string[]; reason?: string } {
   const { value, ...rest } = action;
   if (!value) return { ok: true, action: rest };
   if (value.source === 'recorded') return { ok: true, action: { ...rest, text: value.text } };
+  const secretOnly = isSecretOnlyTemplate(value.template, secretNames);
+  if (action.sensitiveField && !secretOnly) return { ok: false, missing: [], reason: SENSITIVE_TEMPLATE_REASON };
   const r = resolveTemplate(value.template, values);
   if (!r.ok) return { ok: false, missing: r.missing };
-  return { ok: true, action: { ...rest, text: r.text } };
+  return { ok: true, action: { ...rest, text: r.text, ...(secretOnly ? { allowSensitive: true } : {}) } };
 }
 
 // ---- 結果 -------------------------------------------------------------------

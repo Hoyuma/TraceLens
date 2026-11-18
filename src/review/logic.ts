@@ -300,3 +300,16 @@ export function isReordered(steps: readonly Step[]): boolean {
 export function editLockReason(scenario: Pick<Scenario, 'id'>, recordingScenarioId?: string | null): string | null {
   return recordingScenarioId && recordingScenarioId === scenario.id ? t('logic.lockRecording') : null;
 }
+
+/**
+ * 出力の画像のファイル名（screenshots/step-NNNN-<stepId>.png / .press.png）から、手順と画像の成果物を引く。
+ * 成果物 ID はファイル名から組み立てず、手順の参照（screenshot / pressScreenshot）を使う。
+ */
+export function exportImageTarget(path: string, steps: readonly Step[]): { stepId: string; artifactId?: string; press: boolean } | null {
+  const m = /step-\d{4}-(.+?)(\.press)?\.png$/.exec(path);
+  if (!m) return null;
+  const press = !!m[2];
+  const st = steps.find((s) => s.id === m[1]);
+  if (!st) return null;
+  return { stepId: st.id, press, artifactId: press ? st.pressScreenshot?.artifactId : st.screenshot.artifactId };
+}

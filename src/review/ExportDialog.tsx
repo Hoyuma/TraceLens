@@ -6,6 +6,7 @@ import { patchArtifact, patchScenario } from '../shared/db';
 import { newId, type Artifact, type Project, type ReplacementRule, type Scenario, type Step } from '../shared/types';
 import { renderMasked } from '../ui/image';
 import { fmtDateTime } from './ResultViews';
+import { exportImageTarget } from './logic';
 
 interface Props {
   project: Project; scenario: Scenario; steps: Step[]; artifacts: Artifact[];
@@ -60,7 +61,7 @@ export function ExportDialog({ project, scenario, steps, artifacts, replayRun, o
   useEffect(() => { void build(); return () => urls.current.forEach((u) => URL.revokeObjectURL(u)); /* eslint-disable-next-line */ }, [steps, artifacts, withRun]);
 
   const blobUrl = (bytes: Uint8Array) => { const u = URL.createObjectURL(new Blob([bytes as BlobPart], { type: 'image/png' })); urls.current.push(u); return u; };
-  const images = useMemo(() => (result?.files ?? []).filter((f) => f.bytes).map((f) => ({ path: f.path, url: blobUrl(f.bytes!), stepId: f.path.match(/step-\d{4}-(.+)\.png$/)?.[1] ?? '' })), [result]);
+  const images = useMemo(() => (result?.files ?? []).filter((f) => f.bytes).map((f) => ({ path: f.path, url: blobUrl(f.bytes!), target: exportImageTarget(f.path, steps) })), [result]);
   const sel = result?.files.find((f) => f.path === selPath);
   const selImg = images.find((i) => i.path === selPath);
 
@@ -75,7 +76,8 @@ export function ExportDialog({ project, scenario, steps, artifacts, replayRun, o
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(u), 10000);
   };
-  const excludeImage = async (stepId: string) => { await patchArtifact(`shot_${stepId}`, (a) => { a.includeInExport = false; }); await reload(); };
+  // 押下時の画面（.press.png）と操作後の画面を区別し、手順が参照している成果物を対象外にする
+  const excludeImage = async (artifactId?: string) => { if (!artifactId) return; await patchArtifact(artifactId, (a) => { a.includeInExport = false; }); await reload(); };
   const problemOf = (id: string) => (stale ? undefined : result?.ruleProblems.find((p) => p.ruleId === id)?.reason);
 
   return (
@@ -147,7 +149,7 @@ export function ExportDialog({ project, scenario, steps, artifacts, replayRun, o
               <figure key={im.path}>
                 <img src={im.url} alt={im.path} onClick={() => setSelPath(im.path)} />
                 <figcaption><div className="ellipsis" title={im.path}>{im.path.replace('screenshots/', '')}</div>
-                  <div className="row"><button className="link small" onClick={() => { onGoStep(im.stepId); onClose(); }}>{t('ex.fillBtn')}</button><button className="link small" onClick={() => excludeImage(im.stepId)}>{t('ex.excludeImg')}</button></div></figcaption>
+                  {im.target && <div className="row"><button className="link small" onClick={() => { onGoStep(im.target!.stepId); onClose(); }}>{t('ex.fillBtn')}</button><button className="link small" disabled={!im.target.artifactId} onClick={() => excludeImage(im.target!.artifactId)}>{t('ex.excludeImg')}</button></div>}</figcaption>
               </figure>
             ))}
             {result && images.length === 0 && <div className="muted">{t('ex.noImages')}</div>}

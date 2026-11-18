@@ -149,6 +149,18 @@ export function planStepCopy(source: CopySource, target: CopyTarget, opts: CopyO
       artifacts.push({ ...a, id: nid, scenarioId: target.scenario.id, stepId: id, masks: a.masks ? a.masks.map((m) => ({ ...m })) : a.masks, formState: a.formState ? clone(a.formState) : a.formState, meta: a.meta ? clone(a.meta) : a.meta });
       st[field] = { status: 'captured', artifactId: nid };
     }
+    // 押下時の画面（任意）。コピーしない・見つからない場合は、取り込み元を指したまま残さず理由つきの未取得にする
+    const ps = src.pressScreenshot;
+    if (ps?.status === 'captured') {
+      const a = ps.artifactId ? artById.get(ps.artifactId) : undefined;
+      if (!opts.copyArtifacts) st.pressScreenshot = { ...ps, status: 'skipped', artifactId: undefined, reasonCode: 'not-imported', reason: '取り込み時に押下時の画面をコピーしなかった' };
+      else if (!a) st.pressScreenshot = { ...ps, status: 'failed', artifactId: undefined, reasonCode: 'artifact-missing', reason: '取り込み元に押下時の画面のデータが見つからない' };
+      else {
+        const nid = `press_${id}`;
+        artifacts.push({ ...a, id: nid, scenarioId: target.scenario.id, stepId: id, masks: a.masks ? a.masks.map((m) => ({ ...m })) : a.masks, meta: a.meta ? clone(a.meta) : a.meta });
+        st.pressScreenshot = { ...ps, artifactId: nid, notes: ps.notes ? [...ps.notes] : ps.notes };
+      }
+    } else if (ps?.status === 'pending') st.pressScreenshot = { ...ps, status: 'skipped', reasonCode: 'not-captured', reason: '取り込み元で取得が完了していなかった' };
     steps.push(st);
   });
 
@@ -353,6 +365,7 @@ export function parseExportZip(bytes: Uint8Array): ParsedExport {
       includeInExport: true,
       replay: obj(rec.replay) ? clone(rec.replay) : undefined,
       order: typeof rec.order === 'number' ? rec.order : undefined,
+      ...(obj(rec.prefill) ? { prefill: { autofill: obj(rec.prefill)!.autofill === true } } : {}),
     };
 
     // グループ
@@ -377,6 +390,22 @@ export function parseExportZip(bytes: Uint8Array): ParsedExport {
       step.screenshot = { status: 'captured', artifactId: aid };
     } else step.screenshot = sh?.path ? { status: 'failed', reasonCode: 'missing-in-zip', reason: '出力ZIPに画面のファイルがない' } : captureFrom(sh, '画面');
 
+    // 押下時の画面（任意）
+    const pr = obj(arts.pressScreenshot);
+    if (pr) {
+      const times = { pressAt: str(pr.pressAt) || undefined, captureStartedAt: str(pr.captureStartedAt) || undefined, capturedAt: str(pr.capturedAt) || undefined };
+      const prBytes = read(pr.path);
+      if (pr.path && prBytes) {
+        const aid = `press_${rec.id}`;
+        images.push({
+          id: aid, scenarioId: step.scenarioId, stepId: rec.id, type: 'screenshot', capturedAt: str(pr.capturedAt), phase: 'at-press', includeInExport: true,
+          blob: new Blob([prBytes as BlobPart], { type: 'image/png' }), masks: [],
+          meta: { viewport: pr.viewport ?? undefined, targetRectAtCapture: obj(pr.targetRectAtCapture) ? (pr.targetRectAtCapture as Rect) : null, targetRectNote: str(pr.targetRectNote) || undefined, timingNote: arr<string>(pr.notes).join(' / ') || undefined },
+        });
+        step.pressScreenshot = { status: 'captured', artifactId: aid, ...times, notes: arr<string>(pr.notes) };
+      } else step.pressScreenshot = pr.path ? { status: 'failed', reasonCode: 'missing-in-zip', reason: '出力ZIPに押下時の画面のファイルがない', ...times } : { ...captureFrom(pr, '押下時の画面'), ...times };
+    }
+
     // DOM
     const domBytes = read(dm?.path);
     if (dm?.path && domBytes) {
@@ -385,6 +414,7 @@ export function parseExportZip(bytes: Uint8Array): ParsedExport {
       doms.push({
         id: aid, scenarioId: step.scenarioId, stepId: rec.id, type: 'dom', capturedAt: str(dm.capturedAt), phase: PHASES.has(dm.phase) ? dm.phase : 'at-operation', includeInExport: true,
         html: strFromU8(domBytes).replace(DOM_HEADER, ''), formState: arr<FormStateEntry>(fs?.controls), truncated: !!dm.truncated, frameUrl: str(fs?.frameUrl) || undefined,
+        ...(obj(dm.boxViewport) ? { boxViewport: clone(dm.boxViewport) } : {}),
       });
       step.dom = { status: 'captured', artifactId: aid };
     } else step.dom = dm?.path ? { status: 'failed', reasonCode: 'missing-in-zip', reason: '出力ZIPに DOM のファイルがない' } : captureFrom(dm, 'DOM');

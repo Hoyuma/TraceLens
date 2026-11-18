@@ -48,18 +48,57 @@ describe('再生計画', () => {
     ]);
   });
 
-  it('機密欄・ファイル選択は manual になり、値を一切持たない', () => {
+  it('機密欄（テンプレートの指定なし）・ファイル選択は manual になり、値を一切持たない', () => {
     const steps = [
-      mkStep(1, { kind: 'input', value: { kind: 'redacted', redacted: true, redactionReason: '機密欄' }, replay: { valueTemplate: '{{pw}}' } }),
-      mkStep(2, { kind: 'input', value: { kind: 'files' } }),
+      mkStep(1, { kind: 'input', value: { kind: 'redacted', redacted: true, redactionReason: '機密欄' } }),
+      mkStep(2, { kind: 'input', value: { kind: 'files' }, replay: { valueTemplate: '{{f}}' } }),
     ];
     const plan = buildReplayPlan(SC, steps);
     expect(plan.map((a) => a.kind)).toEqual(['manual', 'manual']);
     for (const a of plan) { expect(a.value).toBeUndefined(); expect(a.manualReason).toBeTruthy(); }
-    expect(JSON.stringify(plan)).not.toContain('{{pw}}');
     const pf = preflight(plan, [{ id: 'v', name: 'pw', secret: true }], {});
     expect(pf.manualSteps.map((m) => m.seq)).toEqual([1, 2]);
     expect(pf.missingVariables).toEqual([]); // manual の手順は変数を要求しない
+    expect(pf.sensitiveTemplates).toEqual([]);
+  });
+
+  it('機密欄に secret の変数だけのテンプレートを指定すると入力する。それ以外は開始前に止め、値を作らない', () => {
+    const red = { kind: 'redacted' as const, redacted: true, redactionReason: '機密欄' };
+    const steps = [
+      mkStep(1, { kind: 'input', value: red, replay: { valueTemplate: '{{pw}}' } }),
+      mkStep(2, { kind: 'input', value: red, replay: { valueTemplate: 'abc{{pw}}' } }),
+      mkStep(3, { kind: 'input', value: red, replay: { valueTemplate: '{{code}}' } }),
+    ];
+    const vars = [{ id: 'v', name: 'pw', secret: true }, { id: 'w', name: 'code', defaultValue: 'X' }];
+    const plan = buildReplayPlan(SC, steps);
+    expect(plan.map((a) => [a.kind, a.sensitiveField])).toEqual([['input', true], ['input', true], ['input', true]]);
+    const pf = preflight(plan, vars, { pw: 'S' });
+    expect(pf.sensitiveTemplates.map((m) => m.seq)).toEqual([2, 3]);
+    expect(resolveAction(plan[0], { pw: 'S' }, ['pw'])).toMatchObject({ ok: true, action: { text: 'S', allowSensitive: true } });
+    // secret でない値・テンプレートの文字から機密欄の値を作らない
+    expect(resolveAction(plan[1], { pw: 'S' }, ['pw'])).toMatchObject({ ok: false, missing: [] });
+    expect(resolveAction(plan[2], { code: 'X' }, ['pw'])).toMatchObject({ ok: false, missing: [] });
+    expect(resolveAction(plan[0], { pw: 'S' }, [])).toMatchObject({ ok: false });
+  });
+
+  it('入力済みの値（prefill）は既定で keep-value、テンプレートの指定があれば input になる', () => {
+    const steps = [
+      mkStep(1, { kind: 'prefill', value: { kind: 'text', text: 'user01' }, prefill: { autofill: true } }),
+      mkStep(2, { kind: 'prefill', value: { kind: 'redacted', redacted: true }, prefill: { autofill: true } }),
+      mkStep(3, { kind: 'prefill', value: { kind: 'text', text: 'user01' }, replay: { valueTemplate: '{{user}}' } }),
+      mkStep(4, { kind: 'prefill', value: { kind: 'redacted', redacted: true }, replay: { valueTemplate: '{{pw}}' } }),
+      mkStep(5, { kind: 'click' }),
+    ];
+    const plan = buildReplayPlan(SC, steps);
+    expect(plan.map((a) => a.kind)).toEqual(['keep-value', 'keep-value', 'input', 'input', 'click']);
+    expect(plan[0].value).toBeUndefined();
+    expect(plan[0].wait).toEqual({ kind: 'none' });
+    expect(plan[2].sensitiveField).toBeUndefined();
+    expect(plan[3].sensitiveField).toBe(true);
+    expect(preflight(plan, [{ id: 'v', name: 'pw', secret: true }, { id: 'u', name: 'user' }], { user: 'a', pw: 'b' })).toMatchObject({ missingVariables: [], sensitiveTemplates: [] });
+    expect(plan[0].value).toBeUndefined(); // keep-value は記録値を書き込まない
+    expect(resolveAction(plan[0], {})).toMatchObject({ ok: true, action: { kind: 'keep-value' } });
+    expect((resolveAction(plan[0], {}) as { action: { text?: string } }).action.text).toBeUndefined();
   });
 
   it('kind ごとの action、skip の除外、includeInExport との独立、対象外の種別', () => {

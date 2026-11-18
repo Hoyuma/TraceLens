@@ -3,9 +3,11 @@ import { patchArtifact } from '../shared/db';
 import type { Artifact, Step } from '../shared/types';
 import { fmtTime } from '../shared/describe';
 import { phaseLabel, statusLabel, t as tr } from '../ui/i18n';
+import { DomPreviewDialog } from './DomPreviewDialog';
 
-export function Details({ step, dom, nextOpAt, shot, onChanged }: { step: Step; dom?: Artifact; shot?: Artifact; nextOpAt?: string; onChanged: () => void }) {
+export function Details({ step, dom, nextOpAt, shot, steps, onChanged }: { step: Step; dom?: Artifact; shot?: Artifact; steps?: Step[]; nextOpAt?: string; onChanged: () => void }) {
   const [showDom, setShowDom] = useState(false);
+  const [preview, setPreview] = useState(false);
   useEffect(() => setShowDom(false), [step.id]);
   const t = step.target;
   const kv = (k: string, v: React.ReactNode) => <tr><th style={{ width: 110 }}>{k}</th><td>{v}</td></tr>;
@@ -35,6 +37,8 @@ export function Details({ step, dom, nextOpAt, shot, onChanged }: { step: Step; 
             {t.selectors.map((s, i) => <tr key={i}><td><code>{s.selector}</code><div className="muted">{s.kind} / {s.language}{s.scope === 'shadow-root' ? ` / ${tr('det.inShadow')}` : ''}</div></td><td>{s.matchCount ?? tr('det.unmeasurable')}</td><td>{s.stability === 'suspect' ? '⚠ ' : ''}{s.stabilityNote}</td></tr>)}
           </tbody></table>
           <div className="small muted">{tr('det.matchNote')}</div>
+          {steps && <button data-testid="d-sel-preview" style={{ marginTop: 4 }} onClick={() => setPreview(true)}>{tr('pv.open')}</button>}
+          {preview && steps && <DomPreviewDialog steps={steps} initialStepId={step.id} initialSelector={t.selectors[0] ? { language: t.selectors[0].language, selector: t.selectors[0].selector } : null} onClose={() => setPreview(false)} />}
         </>)}
       </details>
       <details data-testid="d-dom">
@@ -59,6 +63,7 @@ export function Details({ step, dom, nextOpAt, shot, onChanged }: { step: Step; 
             <div key={i}>{o.type === 'dom-mutations' ? tr('det.obsMut', { n: o.count, a: fmtTime(o.firstAt), b: fmtTime(o.lastAt) }) : o.type === 'dom-quiet' ? tr('det.obsQuiet', { time: fmtTime(o.at), ms: o.quietMs }) : o.type === 'url-change' ? tr('det.obsUrl', { time: fmtTime(o.at), to: o.to }) : o.type === 'live-region' ? tr('det.obsLive', { role: o.role, time: fmtTime(o.at), text: o.text }) : tr('det.obsEnd', { time: fmtTime(o.at), reason: o.reason })}</div>
           )) : tr('det.obsNone'))}
           {kv(tr('det.imgCaptured'), shot ? fmtTime(shot.capturedAt) : '—')}
+          {step.pressScreenshot && kv(tr('det.pressTimes'), <span data-testid="d-press-times">{tr('det.pressTimesLine', { press: fmtTime(step.pressScreenshot.pressAt ?? ''), start: step.pressScreenshot.captureStartedAt ? fmtTime(step.pressScreenshot.captureStartedAt) : '—', end: step.pressScreenshot.capturedAt ? fmtTime(step.pressScreenshot.capturedAt) : '—' })}</span>)}
           {kv(tr('det.humanConfirm'), step.humanConfirmedAt ? fmtTime(step.humanConfirmedAt) : tr('common.unverified'))}
           {kv(tr('det.nextOp'), nextOpAt ? fmtTime(nextOpAt) : '—')}
         </tbody></table>
@@ -69,6 +74,7 @@ export function Details({ step, dom, nextOpAt, shot, onChanged }: { step: Step; 
         <table className="t"><tbody>
           {kv(tr('det.screen'), `${statusLabel(step.screenshot.status)}${step.screenshot.reason ? ` — ${step.screenshot.reason}` : ''}`)}
           {shot?.captureInfo && kv(tr('det.capMethod'), <div data-testid="d-capture-info">{{ visible: tr('det.mVisible'), element: tr('det.mElement'), 'full-page': tr('det.mFull') }[shot.captureInfo.method]}{shot.captureInfo.frameCount ? ` / ${tr('det.frames', { n: shot.captureInfo.frameCount })}` : ''}{shot.captureInfo.partial ? ` / ${tr('det.partialCap', { reason: shot.captureInfo.partialReason ?? '' })}` : ''}{shot.captureInfo.notes.map((n, i) => <div key={i} className="muted">{n}</div>)}</div>)}
+          {step.pressScreenshot && kv(tr('det.press'), <span data-testid="d-press-shot">{statusLabel(step.pressScreenshot.status)}{step.pressScreenshot.reason ? ` — ${step.pressScreenshot.reason}` : ''}</span>)}
           {step.beforeScreenshot && kv(tr('det.before'), <span data-testid="d-before-shot">{step.beforeScreenshot.status === 'captured' ? tr('det.beforeRef', { ref: step.beforeScreenshot.refStepId ?? '?', time: fmtTime(step.beforeScreenshot.capturedAt ?? '') }) : tr('det.beforeNone', { reason: step.beforeScreenshot.reason ?? tr('shot.noReason') })}</span>)}
           {kv('DOM', `${statusLabel(step.dom.status)}${step.dom.reason ? ` — ${step.dom.reason}` : ''}`)}
           {kv(tr('det.element'), `${statusLabel(step.elementCapture.status)}${step.elementCapture.reason ? ` — ${step.elementCapture.reason}` : ''}`)}

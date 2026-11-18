@@ -85,6 +85,76 @@ describe('1 手順の実行', () => {
     expect(JSON.stringify(r)).not.toContain('S3cret!');
   });
 
+  it('secret の変数だけから作った値（allowSensitive）なら機密欄に入力し、値を結果に残さない', async () => {
+    document.body.innerHTML = '<input id="pw" type="password">';
+    const r = await executeAction(act('input', { selectors: [css('#pw')], text: 'S3cret!', allowSensitive: true }), { ...env(), beforeAct: async () => true });
+    expect(r.status).toBe('ok');
+    expect((document.getElementById('pw') as HTMLInputElement).value).toBe('S3cret!');
+    expect(r.reason).toContain('secret');
+    expect(JSON.stringify(r)).not.toContain('S3cret!');
+  });
+
+  describe('入力済みの値（keep-value）と自動入力', () => {
+    const realMatches = Element.prototype.matches;
+    /** :autofill / :-webkit-autofill に一致させる要素（jsdom はこの擬似クラスを扱えないため差し替える） */
+    const autofilled = new Set<Element>();
+    afterEach(() => { Element.prototype.matches = realMatches; autofilled.clear(); });
+    const stubAutofill = () => {
+      Element.prototype.matches = function (this: Element, sel: string) {
+        if (sel === ':autofill' || sel === ':-webkit-autofill') return autofilled.has(this);
+        return realMatches.call(this, sel);
+      };
+    };
+
+    it('値が入っていれば書き込まずに ok、値の内容は結果に残さない', async () => {
+      document.body.innerHTML = '<input id="u" value="user01">';
+      let acted = 0;
+      const r = await executeAction(act('keep-value', { selectors: [css('#u')] }), { ...env(), beforeAct: async () => { acted++; return true; } });
+      expect(r.status).toBe('ok');
+      expect(acted).toBe(0); // 操作していない
+      expect((document.getElementById('u') as HTMLInputElement).value).toBe('user01');
+      expect(JSON.stringify(r)).not.toContain('user01');
+    });
+
+    it('上限時間内に値が入れば ok、空のままなら manual（自動入力が渡っていなければその理由）', async () => {
+      document.body.innerHTML = '<input id="u"><input id="pw" type="password">';
+      setTimeout(() => { (document.getElementById('u') as HTMLInputElement).value = 'late'; }, 60);
+      expect((await executeAction(act('keep-value', { selectors: [css('#u')], timeoutMs: 1000 }), env())).status).toBe('ok');
+      stubAutofill();
+      autofilled.add(document.getElementById('pw')!);
+      const r = await executeAction(act('keep-value', { selectors: [css('#pw')], timeoutMs: 150 }), env());
+      expect(r.status).toBe('manual');
+      expect(r.reason).toContain('自動入力');
+      autofilled.clear();
+      const e = await executeAction(act('keep-value', { selectors: [css('#pw')], timeoutMs: 150 }), env());
+      expect(e).toMatchObject({ status: 'manual' });
+      expect(e.reason).toContain('入力欄が空');
+    });
+
+    it('同じフォームに自動入力が渡っていない欄がある間はクリックせず、渡れば操作する', async () => {
+      document.body.innerHTML = '<div id="box"><form><input id="pw" type="password"><input id="go" type="button" value="ログイン"></form></div><button id="other">他</button>';
+      stubAutofill();
+      const pw = document.getElementById('pw') as HTMLInputElement;
+      autofilled.add(pw);
+      let clicked = 0; document.getElementById('go')!.addEventListener('click', () => clicked++);
+      let acted = 0;
+      const r = await executeAction(act('click', { selectors: [css('#go')], timeoutMs: 150 }), { ...env(), beforeAct: async () => { acted++; return true; } });
+      expect(r.status).toBe('failed');
+      expect(r.reason).toContain('自動入力');
+      expect(clicked).toBe(0);
+      expect(acted).toBe(0);
+      // 対象の中に該当する欄がある場合（フォームを含む要素のクリック）も止める
+      expect((await executeAction(act('click', { selectors: [css('#box')], timeoutMs: 100 }), env())).status).toBe('failed');
+      // 関係のない要素のクリックは止めない
+      expect((await executeAction(act('click', { selectors: [css('#other')] }), env())).status).toBe('ok');
+      // 人がページを操作して値が渡ったら操作する
+      setTimeout(() => { pw.value = 'x'; }, 60);
+      const ok = await executeAction(act('click', { selectors: [css('#go')], timeoutMs: 1000 }), env());
+      expect(ok.status).toBe('ok');
+      expect(clicked).toBe(1);
+    });
+  });
+
   it('後から現れる要素を上限時間まで待ち、見つかったら入力する', async () => {
     setTimeout(() => { document.body.innerHTML = '<input name="hours">'; }, 80);
     let acted = 0;

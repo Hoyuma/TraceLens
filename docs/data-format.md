@@ -47,13 +47,13 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | 対象 | 主な項目 |
 |---|---|
 | Project | `id` `name` `description` `createdAt` |
-| Scenario | `name` `purpose` `preconditions` `expectedResult` `openQuestions` `sessions[]`（記録日時・状態・ブラウザ等の環境・一時停止履歴） `groups[]` `replacementRules[]` `variables[]`(v2) |
+| Scenario | `name` `purpose` `preconditions` `expectedResult` `openQuestions` `sessions[]`（記録日時・状態・ブラウザ等の環境・一時停止履歴） `groups[]` `replacementRules[]` `variables[]`(v2) `urlRewrites[]`(v2・省略可。再生時の URL の置き換え `id` `from` `to` `enabled`) |
 | StepGroup | `id` `name` `parentId`(v2, null は最上位) `order`(v2, 同じ親の中の表示順) |
 | ReplacementRule | `find` `replaceWith` `enabled` `isRegex`(v2) `flags`(v2) |
 | ScenarioVariable (v2) | `id` `name` `defaultValue` `description` `secret`。secret の変数は既定値を保存しない（保存 API が落とす） |
 | ReplayRun (v2) | 下記「再生計画と再生結果」 |
 | Step | 下表 |
-| Artifact | `captureInfo`(省略可。手動取得の方法 `method`: `visible`/`element`/`full-page`、`frameCount`、`composedHeightCss`、`pageHeightCss`、`partial`/`partialReason`、`cropRect`/`elementRectCss`/`elementClipped`、`notes[]`) `type`(screenshot/dom) `capturedAt` `phase` `includeInExport`、画像は `blob` `meta` `masks[]`（各要素は `kind`: `fill`(既定)/`blur` を省略可）`crop`(省略可) `cropSourceSize`(省略可)、DOM は `html` `formState[]` |
+| Artifact | `captureInfo`(省略可。手動取得の方法 `method`: `visible`/`element`/`full-page`、`frameCount`、`composedHeightCss`、`pageHeightCss`、`partial`/`partialReason`、`cropRect`/`elementRectCss`/`elementClipped`、`notes[]`) `type`(screenshot/dom) `capturedAt` `phase` `includeInExport`、画像は `blob` `meta` `masks[]`（各要素は `kind`: `fill`(既定)/`blur` を省略可）`crop`(省略可) `cropSourceSize`(省略可)、DOM は `html` `formState[]` `boxViewport`(v2・省略可。要素の位置 `data-tracelens-box` を付けたときのトップのビューポート) |
 
 ### 画像の編集（塗りつぶし・ぼかし・切り抜き）と名前の計算
 
@@ -79,6 +79,7 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | `screenshot` / `dom` / `elementCapture` | 取得状況（`captured` / `failed` / `skipped` / `pending` / `not-applicable`）。失敗・未取得は必ず `reason` を持つ |
 | `limitations[]` | その手順に固有の制限 |
 | `beforeScreenshot` | (v2・省略可) 操作前の画面への参照（任意設定）。`status`: `captured`（`artifactId` `refStepId` `capturedAt` = 参照先の画像の取得時刻）/ `skipped`（`reasonCode` と `reason`）。`basis` は常に `previous-observation`。新しい画像ではなく、直前の観測で取得した画像を、観測の範囲（DOM・スクロール・リサイズ）で画面変化がなかったときだけ参照する。画面が同一である保証ではなく、操作直前に取得した画像でもない |
+| `pressScreenshot` | (v2・省略可) 押下時の画面（任意設定。既定は有効）。`status` `artifactId` `pressAt`（押下）`captureStartedAt`（取得の開始）`capturedAt`（取得の完了）`notes[]`（押下から取得までに観測した変化など）。失敗・未取得は `reasonCode` と `reason`（`rate-limited` `changed-after-operation` `press-late` `press-lost` `page-changed` など）。画像の `phase` は `at-press`。押下の直前と同一の画面である保証はない |
 | `humanConfirmedAt` | 人間が完了を確認した時刻 |
 | `annotation` | 目的、補足、値の種別（未指定／固定／変数）、変数名、入力元、変換ルール、条件（次へ進む／成功、根拠つき）、分岐・繰り返し、未確認事項 |
 | `includeInExport` / `groupId` | 出力対象か／グループ |
@@ -87,7 +88,13 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | `replay` (v2) | 再生・編集の設定（下表）。記録された事実（`target` `value` など）は変えずに別に持つ |
 | `importedFrom` (v2) | 取り込み元（`source`: scenario / export-zip、元のシナリオ ID・名前、元の `stepId` `seq` `operationAt` `operationEndAt` `humanConfirmedAt`、取り込んだ時刻） |
 
-`kind` には v2 で `wait`（人が追加した、待機条件だけの手順）が加わりました。
+`kind` には v2 で `wait`（人が追加した、待機条件だけの手順）と `prefill`（入力済みの値）が加わりました。
+
+`prefill` は人の操作ではありません。人の操作の直前に、入力欄に（人が入力していないのに）値が入っていることを観測した記録です（ブラウザの自動入力・入力内容の復元・ページのスクリプトなど。値が入った経緯と時刻は記録していません）。`operationAt` は値が入っていることを観測した時刻です。`target` と `value` を持ち、機密欄は `value.kind: 'redacted'`（値なし）です。`screenshot` と `dom` は `not-applicable`（直後の操作の手順で保存します）。`limitations` に `prefill`（と、自動入力の表示があった場合は `browser-autofill`）が入ります。
+
+| 項目 | 内容 |
+|---|---|
+| `prefill` (v2) | `kind: 'prefill'` の手順だけ。`{ autofill: boolean }`。`autofill` は観測した時点で自動入力の表示（`:autofill` / `:-webkit-autofill`）に一致したか。一致しなくても自動入力でないとは限らない |
 
 #### 追加・取り込みした手順の番号と時刻
 
@@ -121,6 +128,9 @@ WaitCondition: `kind` = `none` / `element-present` / `element-absent`（`value` 
 - 再生計画（`buildReplayPlan`）は、表示・再生順のうち `replay.skip` でない手順から作ります。`includeInExport` とは独立です。
 - 手順の種別ごとの動作: click / input / select / check / key はそのまま、`session-start` は記録開始時の URL へ移動、`reload` は再読み込み。`navigation` / `spa-navigation` は計画の先頭（または直前が操作でない場合）なら移動、直前がクリックなどの操作なら「その操作の結果として起きる遷移」として URL の一致を待ちます（同じ遷移を二重に起こさない）。操作の後に遷移が続く場合（リダイレクト・フォームの自動送信）は、連鎖のすべてを待機にし、途中の URL を直接開きません。途中の遷移の待機条件は「この遷移先、または同じ連鎖の後続の遷移先」の URL（origin + path、`isRegex: true` の正規表現）です。`wait` は待機だけ。`notice` `manual-capture` `element-note` `session-end` は再生対象外（理由つきで計画に残り、結果は skipped）。
 - 機密欄（`value.kind: 'redacted'`）とファイル選択は自動で入力せず `manual`（人が操作して続行）にします。manual の手順は値を一切持ちません。対象要素のセレクターが無い操作も manual です。
+- 例外として、機密欄の `input` に `replay.valueTemplate` が secret の変数だけ（`{{名前}}` 以外の文字なし）で指定されている場合は `input`（`sensitiveField: true`）にし、再生の開始時に与えた値を書き込みます。secret の変数以外を含む場合は、開始前の確認（`preflight.sensitiveTemplates`）で開始しません。
+- `prefill` は既定で `keep-value`（入力済みの値をそのまま使う。値を書き込まず、入力欄に値が入っていることだけを上限時間まで確かめ、空なら manual で人の操作を待つ。待機条件の既定は「待機しない」）。`replay.valueTemplate` があれば `input` です（機密欄なら上と同じ制約）。
+- クリック・キー操作の前に、同じフォーム（または対象要素の中）に自動入力の表示があるのに値がページに渡っていない欄があれば、上限時間まで待ち、渡らなければ操作せずに失敗にします（`acted: 'no'`）。
 - セレクターは、人の指定 → 記録時の一致が 1 件で suspect でない候補 → 一致 1 件で suspect → その他、の順に試します（同順位は記録の順）。再生時に一致が 1 件のものだけを使う前提です。
 - 実行前の確認（`preflight`）で、値が決まらない変数（実行時入力が必要な secret の変数を含む）、manual の手順、再生対象外の手順を洗い出します。
 
@@ -163,6 +173,7 @@ ReplayRun（`replayRuns` ストア）:
 | 操作が起きた時刻 | `Step.operationAt` |
 | DOM・URL などの変化を観測した時刻 | `Step.observations[]` |
 | 画像を取得した時刻 | `Artifact.capturedAt`（操作後の画面。操作前の画面としては扱わない） |
+| 押下と押下時の画面の取得 | `Step.pressScreenshot.pressAt`（押下）・`captureStartedAt`（取得の開始）・`capturedAt`（取得の完了）。操作時刻・操作後の画面の取得時刻とは別 |
 | 人間が完了を確認した時刻 | `Step.humanConfirmedAt` |
 | 次の操作が起きた時刻 | 出力時に導出（`steps.json` の `time.nextOperationAt`） |
 
@@ -193,6 +204,10 @@ tracelens-export/
 - 手順は表示・再生順（`order`）で並べます。ファイル名の `NNNN` と手順番号は元の `seq` のままです。
 
 ### v2 で追加した出力項目
+
+- `steps[].artifacts.pressScreenshot`（押下時の画面。`path` は `screenshots/step-NNNN-<stepId>.press.png`、`pressAt` `captureStartedAt` `capturedAt` `notes` `viewport` `targetRectAtCapture` など。対象外・未取得は `path: null` と理由）。`steps[].time.pressAt` `pressScreenshotCapturedAt`。
+- `steps[].artifacts.dom.boxViewport` と、DOM の要素の `data-tracelens-box="x,y,w,h"`（DOM の取得時点の位置。トップのビューポート基準, CSS px。画像の取得時刻とは別。クロスオリジンのフレーム内の文書には付けない）。
+- `replayUrlRewrites[]`（再生時の URL の置き換えの規則 `from` `to` `enabled`。記録した URL は書き換えていない）。
 
 - `steps[].artifacts.screenshot.capture`（取得方法 `method` と合成・切り出しの情報 `frameCount` `partial` `partialReason` `cropRect` `elementRectCss` `notes[]`）、`reason`（途中までの場合など）。`steps[].beforeScreenshot`（`status` `path` `basis` `refStepId` `referencedImageCapturedAt` `reason` `note`）。参照先の画像が出力に含まれない場合は `status: 'unavailable'`・`path: null` と理由を出し、壊れた参照を作らない。
 
