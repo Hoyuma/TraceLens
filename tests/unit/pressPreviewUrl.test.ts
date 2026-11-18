@@ -6,6 +6,7 @@ import { rewriteUrl, validateUrlRewrite } from '../../src/shared/urlRewrite';
 import { buildReplayPlan, URL_REWRITE_NOTE } from '../../src/shared/replay';
 import { serializeDom, BOX_ATTR } from '../../src/shared/domSerialize';
 import { buildExport, validateReferences } from '../../src/shared/export';
+import { exportImageTarget } from '../../src/review/logic';
 import { boxOf, matchSelector, overlayCheck, prepareSnapshot, INDEX_ATTR } from '../../src/review/preview';
 import type { Artifact, UrlRewrite } from '../../src/shared/types';
 import { mkArtifacts, mkProject, mkScenario, mkStep, renderStub } from './fixtures';
@@ -143,5 +144,14 @@ describe('押下時の画面の出力', () => {
     expect(sj.steps[1].artifacts.pressScreenshot).toMatchObject({ path: null, status: 'skipped', reason: '上限' });
     expect(r.brokenReferences).toEqual([]);
     expect(validateReferences([{ path: 'README.md', text: 'screenshots/step-0001-x.press.png' }])).toEqual(['README.md -> screenshots/step-0001-x.press.png']);
+  });
+});
+
+describe('出力ダイアログの画像と手順の対応', () => {
+  it('.press.png は押下時の画面の成果物、.png は操作後の画面の成果物を指す', () => {
+    const s = mkStep(3, { id: 'stp_abc_1', pressScreenshot: { status: 'captured', artifactId: 'press_stp_abc_1' } });
+    expect(exportImageTarget('screenshots/step-0003-stp_abc_1.press.png', [s])).toEqual({ stepId: 'stp_abc_1', press: true, artifactId: 'press_stp_abc_1' });
+    expect(exportImageTarget('screenshots/step-0003-stp_abc_1.png', [s])).toEqual({ stepId: 'stp_abc_1', press: false, artifactId: 'shot_stp_abc_1' });
+    expect(exportImageTarget('screenshots/step-0003-other.png', [s])).toBeNull();
   });
 });
