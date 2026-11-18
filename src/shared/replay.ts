@@ -13,7 +13,8 @@
 //  - 結果の ok は「操作を実行し、待機条件を観測できた」という意味で、業務処理の完了を意味しない。
 import { orderedSteps } from './steps';
 import { extractVariableNames, isSecretOnlyTemplate, resolveTemplate } from './variables';
-import type { FrameHop, ISO, Scenario, ScenarioVariable, SelectorCandidate, Step, StepKind, WaitCondition } from './types';
+import type { FrameHop, ISO, Scenario, ScenarioVariable, SelectorCandidate, Step, StepKind, UrlRewrite, WaitCondition } from './types';
+import { rewriteUrl } from './urlRewrite';
 import { stepSummary } from './describe';
 
 /** 1 手順あたりの既定の上限時間（対象要素の出現待ち + 操作 + 待機条件の観測） */
@@ -148,7 +149,9 @@ export function chainUrlWait(urls: readonly string[]): WaitCondition {
 }
 
 const isNav = (s: Step) => s.kind === 'navigation' || s.kind === 'spa-navigation';
-const navUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
+const rawNavUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
+/** 再生時の URL の置き換えを使った手順の注記 */
+export const URL_REWRITE_NOTE = '記録した URL を、シナリオの「URL の置き換え」で置き換えて再生した（記録は書き換えていない）';
 
 /**
  * 再生計画を作る（scenario に属する手順だけを使う）。範囲の ID が見つからない場合は Error を投げる。
@@ -162,7 +165,7 @@ const navUrl = (s: Step) => s.navigation?.toUrl ?? s.page.url;
  *   連鎖の途中の URL を直接開くと、POST の本文や使い捨てのトークンが失われ、別の画面になるため
  *   （実際の業務サイトで、自動送信の画面とトークン付き URL を GET で開き直して後続の手順が失敗した）。
  */
-export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly Step[], opts: ReplayPlanOptions = {}): ReplayAction[] {
+export function buildReplayPlan(scenario: Pick<Scenario, 'id' | 'urlRewrites'>, steps: readonly Step[], opts: ReplayPlanOptions = {}): ReplayAction[] {
   const all = orderedSteps(steps.filter((s) => s.scenarioId === scenario.id));
   let list = all.filter((s) => !s.replay?.skip);
   if (opts.fromStepId || opts.toStepId) {
@@ -184,11 +187,15 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
     list = list.filter((s) => only.has(s.id));
   }
 
-  return list.map((s, index) => {
+  // 再生時の URL の置き換え（記録した URL は書き換えない）。置き換えた手順には注記を付ける
+  const used: { rule?: UrlRewrite } = {};
+  const rw = (u: string): string => { const x = rewriteUrl(u, scenario.urlRewrites); if (x.rule) used.rule ??= x.rule; return x.url; };
+  const navUrl = (s: Step) => rw(rawNavUrl(s));
+  const actionFor = (s: Step, index: number): ReplayAction => {
     const r = s.replay ?? {};
     const base: ReplayAction = {
       stepId: s.id, seq: s.seq, index, kind: 'unsupported', stepKind: s.kind, label: stepSummary(s),
-      selectors: rankSelectors(s), frame: s.frame.path, frameUrl: s.frame.url, shadowPath: s.target?.shadowPath ?? [],
+      selectors: rankSelectors(s), frame: s.frame.path, frameUrl: rw(s.frame.url), shadowPath: s.target?.shadowPath ?? [],
       wait: r.wait ?? { ...DEFAULT_WAIT }, onFail: r.onFail ?? DEFAULT_ON_FAIL, timeoutMs: r.timeoutMs && r.timeoutMs > 0 ? r.timeoutMs : DEFAULT_REPLAY_TIMEOUT_MS,
     };
     const prev = list[index - 1];
@@ -215,8 +222,8 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
         if (isRedacted(s)) return manual('機密欄のため状態を保存していない。人が操作して続行する');
         return needTarget({ ...base, kind: 'check', checked: !!s.value?.checked });
       case 'key': return { ...base, kind: 'key', key: s.key };
-      case 'session-start': return { ...base, kind: 'navigate', url: s.page.url };
-      case 'reload': return { ...base, kind: 'navigate', url: s.navigation?.toUrl ?? s.page.url, reload: true, note: RELOAD_AS_GET_NOTE };
+      case 'session-start': return { ...base, kind: 'navigate', url: rw(s.page.url) };
+      case 'reload': return { ...base, kind: 'navigate', url: rw(s.navigation?.toUrl ?? s.page.url), reload: true, note: RELOAD_AS_GET_NOTE };
       case 'navigation': case 'spa-navigation': {
         const url = navUrl(s);
         // 直前までさかのぼった遷移の連鎖の起点（遷移でない最初の手順）
@@ -241,6 +248,14 @@ export function buildReplayPlan(scenario: Pick<Scenario, 'id'>, steps: readonly 
       }
       default: return { ...base, kind: 'unsupported', unsupportedReason: UNSUPPORTED[s.kind] ?? '再生に対応していない種別' };
     }
+  };
+  return list.map((s, index) => {
+    used.rule = undefined;
+    const a = actionFor(s, index);
+    const rule = used.rule as UrlRewrite | undefined; // actionFor の中で設定される
+    if (!rule) return a;
+    const n = `${URL_REWRITE_NOTE}（${rule.from} → ${rule.to}）`;
+    return { ...a, note: a.note ? `${a.note} / ${n}` : n };
   });
 }
 

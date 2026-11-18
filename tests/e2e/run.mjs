@@ -404,12 +404,39 @@ try {
   const fb = await review.locator('[data-testid="fallback-label"]').textContent();
   check('R05', '画面がない手順は理由を表示し、代わりの画像は「直前の記録画面」と明示して強調表示しない', /遷移/.test(noShot) && /直前の記録画面/.test(fb) && (await review.locator('[data-testid="highlight"]').count()) === 0, noShot);
   check('R06', '取得失敗のある手順と、画面を取得していない手順が一覧で区別して示される', (await review.locator('[data-testid="flag-fail"]').count()) >= 2 && (await review.locator('[data-testid="flag-skip"]').count()) >= 1, '');
-  const lateShots = db.artifacts.filter((a) => a.meta?.timingNote);
+  // 押下時の画面の注記も timingNote に入るため、操作後の画面だけを対象にする
+  const lateShots = db.artifacts.filter((a) => a.meta?.timingNote && a.phase !== 'at-press');
   check('R07', '静止を待てずに次の操作の開始時点で取得した画像は、その旨が画像に記録される', lateShots.length >= 1 && lateShots.every((a) => a.meta.timingNote.includes('次の操作の開始時点')), `late=${lateShots.length}`);
+
+  // --- 18b. 押下時の画面と画面プレビュー ---
+  const pressSteps = db.steps.filter((s) => s.pressScreenshot);
+  const pressCaptured = pressSteps.filter((s) => s.pressScreenshot.status === 'captured');
+  check('K01', '押下時の画面を操作後の画面とは別に取得し、未取得は理由を持つ', pressCaptured.length >= 1 && pressCaptured.every((s) => db.artifacts.some((a) => a.id === s.pressScreenshot.artifactId && a.phase === 'at-press') && s.screenshot.artifactId !== s.pressScreenshot.artifactId) && pressSteps.every((s) => s.pressScreenshot.status === 'captured' || !!s.pressScreenshot.reason), JSON.stringify(pressSteps.map((s) => [s.seq, s.kind, s.pressScreenshot.status, s.pressScreenshot.reasonCode])));
+  const pressedSave = db.steps.find((s) => s.id === saveId).pressScreenshot;
+  await review.click(`[data-step-id="${saveId}"]`);
+  await review.waitForSelector('[data-testid="shot"] img');
+  const kindBtns = await review.locator('[data-testid="shot-kind"]').count();
+  check('K02', '押下時の画面がある手順は、押下時と操作後の画面を切り替えられる', !pressedSave || kindBtns === 1, JSON.stringify(pressedSave?.status ?? null));
+  await review.click('[data-testid="d-selectors"] summary');
+  await review.click('[data-testid="d-sel-preview"]');
+  await review.waitForSelector('[data-testid="pv-frame"]');
+  await sleep(500);
+  const pvCount = await review.locator('[data-testid="pv-count"]').textContent();
+  const pvHit = await review.frameLocator('[data-testid="pv-frame"]').locator('[data-tl-hit]').count();
+  const pvExternal = await review.frameLocator('[data-testid="pv-frame"]').locator('script, link, img[src]').count();
+  check('K03', '画面プレビューで、記録したセレクターに一致した要素を DOM に示し、読み込みを起こす要素を含めない', /1 件に一致/.test(pvCount) && pvHit === 1 && pvExternal === 0, JSON.stringify([pvCount, pvHit, pvExternal]));
+  await review.click('[data-testid="pv-pick"]');
+  const layer = await review.locator('[data-testid="pv-layer"]').boundingBox();
+  await review.mouse.click(layer.x + 40, layer.y + 40);
+  const picked = await review.locator('[data-testid="pv-picked"]').count();
+  check('K04', '画面プレビューで DOM の要素をクリックすると、セレクター候補を作る', picked === 1, '');
+  await review.click('[data-testid="dom-preview"] [data-testid="modal-close"]');
 
   // --- 19. 塗りつぶし・除外・置換 → ZIP 出力 ---
   await review.click(`[data-step-id="${saveId}"]`);
   await review.waitForSelector('[data-testid="shot"] img');
+  // 塗りつぶしは操作後の画面に付ける（既定の表示は押下時の画面）
+  if (await review.locator('[data-testid="shot-kind-after"]').count()) { await review.click('[data-testid="shot-kind-after"]'); await sleep(200); }
   await review.click('[data-testid="btn-mask"]');
   const box = await review.locator('[data-testid="shot"]').boundingBox();
   await review.mouse.move(box.x + box.width * 0.10, box.y + box.height * 0.20);

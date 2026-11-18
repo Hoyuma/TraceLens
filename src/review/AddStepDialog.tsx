@@ -8,6 +8,7 @@ import { kindLabel } from '../shared/describe';
 import { getLang, t } from '../ui/i18n';
 import { validateSelectorText, validateWaitCondition } from './logic';
 import { WaitEditor } from './WaitEditor';
+import { DomPreviewDialog } from './DomPreviewDialog';
 
 type AddKind = Extract<StepKind, 'wait' | 'click' | 'input' | 'select' | 'check' | 'navigation'>;
 const KINDS: AddKind[] = ['wait', 'click', 'input', 'select', 'check', 'navigation'];
@@ -34,6 +35,7 @@ export function AddStepDialog({ scenario, steps, afterStepId, groupId, onClose, 
   const [purpose, setPurpose] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState(false);
   const flat = flattenGroupTree(scenario.groups);
   const needsSelector = kind === 'click' || kind === 'input' || kind === 'select' || kind === 'check';
 
@@ -89,8 +91,13 @@ export function AddStepDialog({ scenario, steps, afterStepId, groupId, onClose, 
             <select data-testid="add-step-lang" style={{ width: 80 }} value={lang} onChange={(e) => setLang(e.target.value as 'css' | 'xpath')}><option value="css">CSS</option><option value="xpath">XPath</option></select>
             <input data-testid="add-step-selector" className="grow" value={selector} placeholder={lang === 'css' ? t('add.cssPh') : t('add.xpathPh')} onChange={(e) => setSelector(e.target.value)} />
           </div>
+          <div className="row" style={{ marginTop: 4 }}><button data-testid="add-step-preview" onClick={() => setPreview(true)}>{t('pv.open')}</button><span className="small muted">{t('pv.openNoteAdd')}</span></div>
           <div className="small muted">{t('add.selNote')}</div>
         </div>
+      )}
+      {preview && (
+        <DomPreviewDialog steps={steps} initialStepId={afterStepId} initialSelector={selector.trim() ? { language: lang, selector } : null}
+          onPick={(p) => { setLang(p.language); setSelector(p.selector); setPreview(false); }} onClose={() => setPreview(false)} />
       )}
       {(kind === 'input' || kind === 'select') && (
         <label className="f"><span>{kind === 'input' ? t('add.valueInput') : t('add.valueSelect')}</span>

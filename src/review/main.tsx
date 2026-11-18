@@ -8,7 +8,7 @@ import { orderedSteps } from '../shared/steps';
 import type { ReplayRun } from '../shared/replay';
 import { newId, type Artifact, type Project, type Scenario, type Step } from '../shared/types';
 import { fmtTime, stepSummary, captureProblems, kindLabel } from '../shared/describe';
-import { originLabel, t, useI18n } from '../ui/i18n';
+import { originLabel, statusLabel, t, useI18n } from '../ui/i18n';
 import { ExportDialog } from './ExportDialog';
 import { ShotView } from './ShotView';
 import { Details } from './Details';
@@ -80,7 +80,11 @@ function App() {
   const artById = useMemo(() => new Map(arts.map((a) => [a.id, a])), [arts]);
   const sel = steps.find((s) => s.id === selId) ?? ordered[0] ?? null;
   const shotOf = (s: Step) => (s.screenshot.status === 'captured' && s.screenshot.artifactId ? artById.get(s.screenshot.artifactId) : undefined);
-  const shot = sel ? shotOf(sel) : undefined;
+  const afterShot = sel ? shotOf(sel) : undefined;
+  const pressArt = sel?.pressScreenshot?.status === 'captured' && sel.pressScreenshot.artifactId ? artById.get(sel.pressScreenshot.artifactId) : undefined;
+  const [shotKind, setShotKind] = useState<'press' | 'after'>('press');
+  const showPress = shotKind === 'press' && !!pressArt;
+  const shot = showPress ? pressArt : afterShot;
   const dom = sel?.dom.artifactId ? artById.get(sel.dom.artifactId) : undefined;
   const fallback = useMemo(() => {
     if (!sel || shot) return undefined;
@@ -159,7 +163,15 @@ function App() {
           </div>
           <div className="col mid">
             {showInfo && <ScenarioInfo scenario={scenario} onSaved={reload} />}
-            {(showReplay || replayingThis) && <ReplayPanel scenario={scenario} steps={steps} selId={sel?.id ?? null} session={session} replay={replay} runs={runs} viewRunId={viewRun?.id ?? null} onViewRun={setViewRunId} onGoEdit={goEdit} onSelectStep={setSelId} />}
+            {(showReplay || replayingThis) && <ReplayPanel scenario={scenario} steps={steps} selId={sel?.id ?? null} session={session} replay={replay} runs={runs} viewRunId={viewRun?.id ?? null} onViewRun={setViewRunId} onGoEdit={goEdit} onSelectStep={setSelId} onChanged={reload} />}
+            {sel && sel.pressScreenshot && (
+              <div className="row small" style={{ marginBottom: 6, flexWrap: 'wrap' }} data-testid="shot-kind">
+                <button className={showPress ? 'on' : ''} data-testid="shot-kind-press" disabled={!pressArt} onClick={() => setShotKind('press')}>{t('rv.shotPress')}</button>
+                <button className={!showPress ? 'on' : ''} data-testid="shot-kind-after" onClick={() => setShotKind('after')}>{t('rv.shotAfter')}</button>
+                {!pressArt && <span className="muted" data-testid="press-none">{t('rv.pressNone', { status: statusLabel(sel.pressScreenshot.status), reason: sel.pressScreenshot.reason ?? t('shot.noReason') })}</span>}
+              </div>
+            )}
+            {sel && showPress && (sel.pressScreenshot?.notes?.length ?? 0) > 0 && <div className="note info small" data-testid="press-notes">{sel.pressScreenshot!.notes!.join(' / ')}</div>}
             {sel ? <ShotView step={sel} art={shot} fallback={fallback} onChanged={reload} /> : <div className="empty">{t('rv.selectLeft')}</div>}
           </div>
           <div className="col side">
@@ -202,13 +214,13 @@ function App() {
                   {groupErr && <div className="note err">{groupErr}</div>}
                   <div className="row small muted" style={{ marginTop: 3 }}>{t('rv.rangeLabel')}{' '}<input style={{ width: 48 }} value={range.from} placeholder={String(sel.seq)} onChange={(e) => setRange({ ...range, from: e.target.value })} />〜<input style={{ width: 48 }} value={range.to} placeholder={String(sel.seq)} onChange={(e) => setRange({ ...range, to: e.target.value })} />{t('rv.rangeHint')}</div>
                 </div>
-                <Details step={sel} dom={dom} shot={shot} nextOpAt={nextOpAt} onChanged={reload} />
+                <Details step={sel} dom={dom} shot={afterShot} steps={steps} nextOpAt={nextOpAt} onChanged={reload} />
               </>)}
               {tab === 'replay' && (<>
                 <div className="sec-title" style={{ marginTop: 8 }}>{t('rv.replayResult')}</div>
                 <StepResultView result={results.get(sel.id)} run={viewRun} onEdit={() => setTab('replay')} />
                 <div className="sec-title" style={{ marginTop: 12 }}>{t('rv.replaySettings')}</div>
-                <StepReplayEditor key={sel.id} step={sel} scenario={scenario} onSaved={reload} />
+                <StepReplayEditor key={sel.id} step={sel} scenario={scenario} steps={steps} onSaved={reload} />
               </>)}
             </>)}
           </div>

@@ -3,6 +3,8 @@
 // - 機密欄の value 属性は出力しない。フォームの現在値は formState に別途保存（機密欄は redacted）
 // - open Shadow DOM は <template shadowrootmode="open"> として展開
 // - iframe の中身は展開しない（フレーム内で操作があれば、そのフレーム自身のスナップショットを取る）
+// - box を渡すと、各要素に data-tracelens-box="x,y,w,h"（取得時点の位置。トップのビューポート基準, CSS px）を付ける。
+//   レビュー画面で、セレクターに一致した要素を画像の上に示すためのもの。画像の取得時刻とは別の時点の位置。
 import type { FormStateEntry } from './types';
 import { isSensitiveField } from './sensitive';
 
@@ -13,8 +15,9 @@ function escText(s: string): string { return s.replace(/&/g, '&amp;').replace(/<
 function escAttr(s: string): string { return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
 
 export interface SerializeResult { html: string; formState: FormStateEntry[]; truncated: boolean }
+export const BOX_ATTR = 'data-tracelens-box';
 
-export function serializeDom(root: Node, maxChars = 3_000_000, collectForm = true): SerializeResult {
+export function serializeDom(root: Node, maxChars = 3_000_000, collectForm = true, box?: (el: Element) => string | null): SerializeResult {
   const out: string[] = [];
   const formState: FormStateEntry[] = [];
   let size = 0;
@@ -34,6 +37,7 @@ export function serializeDom(root: Node, maxChars = 3_000_000, collectForm = tru
     let s = `<${tag}`;
     for (const a of Array.from(el.attributes)) {
       if (sensitive && a.name.toLowerCase() === 'value') continue;
+      if (a.name.toLowerCase() === BOX_ATTR) continue; // ページ自身が持つ同名の属性は、位置の記録と混同しないよう出力しない
       s += ` ${a.name}="${escAttr(a.value)}"`;
     }
     if (tag === 'input' || tag === 'textarea' || tag === 'select') {
@@ -47,6 +51,7 @@ export function serializeDom(root: Node, maxChars = 3_000_000, collectForm = tru
       s += ` data-tracelens-frame="${access}"`;
     }
     if (tag === 'canvas') s += ' data-tracelens-note="canvas-content-not-captured"';
+    if (box) { const b = box(el); if (b) s += ` ${BOX_ATTR}="${b}"`; }
     emit(s + '>');
     if (VOID.has(tag)) return;
     if (tag === 'script' || tag === 'style') { emit(`/* TraceLens: ${tag} の内容は保存しない */`); }

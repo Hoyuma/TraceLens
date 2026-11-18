@@ -244,6 +244,7 @@ function App() {
         <details style={{ marginTop: 8, borderTop: 'none' }} data-testid="record-options">
           <summary className="small">{t('sp.optSummary')}</summary>
           <div className="small muted" style={{ marginTop: 4 }}>{t('sp.optNote')}</div>
+          <label className="row small" style={{ gap: 4, marginTop: 6, alignItems: 'flex-start' }}><input type="checkbox" data-testid="opt-press-shot" disabled={!!session} checked={settings.pressShot !== false} onChange={(e) => changeSetting({ pressShot: e.target.checked })} /><span>{t('sp.optPress')}</span></label>
           <label className="row small" style={{ gap: 4, marginTop: 6, alignItems: 'flex-start' }}><input type="checkbox" data-testid="opt-before-shot" disabled={!!session} checked={!!settings.beforeShot} onChange={(e) => changeSetting({ beforeShot: e.target.checked })} /><span>{t('sp.optBefore')}</span></label>
           <label className="row small" style={{ gap: 4, marginTop: 6, alignItems: 'flex-start' }}><input type="checkbox" data-testid="opt-follow-tab" disabled={!!session} checked={!!settings.followNewTab} onChange={(e) => toggleFollow(e.target.checked)} /><span>{t('sp.optFollow')}</span></label>
         </details>

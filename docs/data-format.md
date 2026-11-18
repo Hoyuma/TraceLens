@@ -47,13 +47,13 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | 対象 | 主な項目 |
 |---|---|
 | Project | `id` `name` `description` `createdAt` |
-| Scenario | `name` `purpose` `preconditions` `expectedResult` `openQuestions` `sessions[]`（記録日時・状態・ブラウザ等の環境・一時停止履歴） `groups[]` `replacementRules[]` `variables[]`(v2) |
+| Scenario | `name` `purpose` `preconditions` `expectedResult` `openQuestions` `sessions[]`（記録日時・状態・ブラウザ等の環境・一時停止履歴） `groups[]` `replacementRules[]` `variables[]`(v2) `urlRewrites[]`(v2・省略可。再生時の URL の置き換え `id` `from` `to` `enabled`) |
 | StepGroup | `id` `name` `parentId`(v2, null は最上位) `order`(v2, 同じ親の中の表示順) |
 | ReplacementRule | `find` `replaceWith` `enabled` `isRegex`(v2) `flags`(v2) |
 | ScenarioVariable (v2) | `id` `name` `defaultValue` `description` `secret`。secret の変数は既定値を保存しない（保存 API が落とす） |
 | ReplayRun (v2) | 下記「再生計画と再生結果」 |
 | Step | 下表 |
-| Artifact | `captureInfo`(省略可。手動取得の方法 `method`: `visible`/`element`/`full-page`、`frameCount`、`composedHeightCss`、`pageHeightCss`、`partial`/`partialReason`、`cropRect`/`elementRectCss`/`elementClipped`、`notes[]`) `type`(screenshot/dom) `capturedAt` `phase` `includeInExport`、画像は `blob` `meta` `masks[]`（各要素は `kind`: `fill`(既定)/`blur` を省略可）`crop`(省略可) `cropSourceSize`(省略可)、DOM は `html` `formState[]` |
+| Artifact | `captureInfo`(省略可。手動取得の方法 `method`: `visible`/`element`/`full-page`、`frameCount`、`composedHeightCss`、`pageHeightCss`、`partial`/`partialReason`、`cropRect`/`elementRectCss`/`elementClipped`、`notes[]`) `type`(screenshot/dom) `capturedAt` `phase` `includeInExport`、画像は `blob` `meta` `masks[]`（各要素は `kind`: `fill`(既定)/`blur` を省略可）`crop`(省略可) `cropSourceSize`(省略可)、DOM は `html` `formState[]` `boxViewport`(v2・省略可。要素の位置 `data-tracelens-box` を付けたときのトップのビューポート) |
 
 ### 画像の編集（塗りつぶし・ぼかし・切り抜き）と名前の計算
 
@@ -79,6 +79,7 @@ tests/e2e/       実ブラウザ検証（Playwright）
 | `screenshot` / `dom` / `elementCapture` | 取得状況（`captured` / `failed` / `skipped` / `pending` / `not-applicable`）。失敗・未取得は必ず `reason` を持つ |
 | `limitations[]` | その手順に固有の制限 |
 | `beforeScreenshot` | (v2・省略可) 操作前の画面への参照（任意設定）。`status`: `captured`（`artifactId` `refStepId` `capturedAt` = 参照先の画像の取得時刻）/ `skipped`（`reasonCode` と `reason`）。`basis` は常に `previous-observation`。新しい画像ではなく、直前の観測で取得した画像を、観測の範囲（DOM・スクロール・リサイズ）で画面変化がなかったときだけ参照する。画面が同一である保証ではなく、操作直前に取得した画像でもない |
+| `pressScreenshot` | (v2・省略可) 押下時の画面（任意設定。既定は有効）。`status` `artifactId` `pressAt`（押下）`captureStartedAt`（取得の開始）`capturedAt`（取得の完了）`notes[]`（押下から取得までに観測した変化など）。失敗・未取得は `reasonCode` と `reason`（`rate-limited` `changed-after-operation` `press-late` `press-lost` `page-changed` など）。画像の `phase` は `at-press`。押下の直前と同一の画面である保証はない |
 | `humanConfirmedAt` | 人間が完了を確認した時刻 |
 | `annotation` | 目的、補足、値の種別（未指定／固定／変数）、変数名、入力元、変換ルール、条件（次へ進む／成功、根拠つき）、分岐・繰り返し、未確認事項 |
 | `includeInExport` / `groupId` | 出力対象か／グループ |
@@ -172,6 +173,7 @@ ReplayRun（`replayRuns` ストア）:
 | 操作が起きた時刻 | `Step.operationAt` |
 | DOM・URL などの変化を観測した時刻 | `Step.observations[]` |
 | 画像を取得した時刻 | `Artifact.capturedAt`（操作後の画面。操作前の画面としては扱わない） |
+| 押下と押下時の画面の取得 | `Step.pressScreenshot.pressAt`（押下）・`captureStartedAt`（取得の開始）・`capturedAt`（取得の完了）。操作時刻・操作後の画面の取得時刻とは別 |
 | 人間が完了を確認した時刻 | `Step.humanConfirmedAt` |
 | 次の操作が起きた時刻 | 出力時に導出（`steps.json` の `time.nextOperationAt`） |
 
@@ -202,6 +204,10 @@ tracelens-export/
 - 手順は表示・再生順（`order`）で並べます。ファイル名の `NNNN` と手順番号は元の `seq` のままです。
 
 ### v2 で追加した出力項目
+
+- `steps[].artifacts.pressScreenshot`（押下時の画面。`path` は `screenshots/step-NNNN-<stepId>.press.png`、`pressAt` `captureStartedAt` `capturedAt` `notes` `viewport` `targetRectAtCapture` など。対象外・未取得は `path: null` と理由）。`steps[].time.pressAt` `pressScreenshotCapturedAt`。
+- `steps[].artifacts.dom.boxViewport` と、DOM の要素の `data-tracelens-box="x,y,w,h"`（DOM の取得時点の位置。トップのビューポート基準, CSS px。画像の取得時刻とは別。クロスオリジンのフレーム内の文書には付けない）。
+- `replayUrlRewrites[]`（再生時の URL の置き換えの規則 `from` `to` `enabled`。記録した URL は書き換えていない）。
 
 - `steps[].artifacts.screenshot.capture`（取得方法 `method` と合成・切り出しの情報 `frameCount` `partial` `partialReason` `cropRect` `elementRectCss` `notes[]`）、`reason`（途中までの場合など）。`steps[].beforeScreenshot`（`status` `path` `basis` `refStepId` `referencedImageCapturedAt` `reason` `note`）。参照先の画像が出力に含まれない場合は `status: 'unavailable'`・`path: null` と理由を出し、壊れた参照を作らない。
 

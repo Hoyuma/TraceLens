@@ -3,7 +3,8 @@
 // - 記録中でない/一時停止中は何も送らない
 import type { ArtifactPhase, CaptureStatus, FrameHop, FrameInfo, Limitation, Observation, PageInfo, ScreenshotMeta, StepKind, ValueInfo } from '../shared/types';
 import { newId } from '../shared/types';
-import type { ContentMsg, DomFailure, DomPayload, FinishReply, HelloReply, ScanBeginReply, ScanEndReply, ScanScrollReply, ShotMetaReply, StepDraft, ToContentMsg } from '../shared/messages';
+import type { ContentMsg, DomFailure, DomPayload, FinishReply, HelloReply, PressRectReply, ScanBeginReply, ScanEndReply, ScanScrollReply, ShotMetaReply, StepDraft, ToContentMsg } from '../shared/messages';
+import { pressRelated } from '../shared/pressShot';
 import type { ChangeKind } from '../shared/beforeShot';
 import { describeElement, readValue } from '../shared/elementInfo';
 import { serializeDom } from '../shared/domSerialize';
@@ -79,12 +80,35 @@ declare global { interface Window { __tracelensContent?: boolean } }
   }
 
   // ---- DOM スナップショット -------------------------------------------------
+  /** このフレームの左上の、トップのビューポート上の位置。クロスオリジンを挟むなど確認できなければ null */
+  function frameOffset(): { x: number; y: number; top: Window } | null {
+    let x = 0, y = 0;
+    let w: Window = window;
+    try {
+      while (w !== w.parent) {
+        const fe = w.frameElement;
+        if (!fe) return null;
+        const fr = fe.getBoundingClientRect();
+        x += fr.x + fe.clientLeft; y += fr.y + fe.clientTop;
+        w = w.parent;
+      }
+      return { x, y, top: w };
+    } catch { return null; }
+  }
   function snapshotDom(phase: ArtifactPhase): DomPayload | DomFailure {
     try {
       markSensitiveFields(document);
-      const r = serializeDom(document);
+      // 要素の位置（トップのビューポート基準）。レビュー画面でセレクターに一致した要素を画像に重ねるためのもの
+      const off = frameOffset();
+      const box = off ? (el: Element) => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return null;
+        return `${Math.round(r.x + off.x)},${Math.round(r.y + off.y)},${Math.round(r.width)},${Math.round(r.height)}`;
+      } : undefined;
+      const r = serializeDom(document, undefined, true, box);
       const dt = document.doctype ? `<!DOCTYPE ${document.doctype.name}>\n` : '';
-      return { html: dt + r.html, formState: r.formState, truncated: r.truncated, phase, capturedAt: iso(), frameUrl: location.href };
+      const boxViewport = off ? { width: off.top.innerWidth, height: off.top.innerHeight, scrollX: Math.round(off.top.scrollX), scrollY: Math.round(off.top.scrollY) } : undefined;
+      return { html: dt + r.html, formState: r.formState, truncated: r.truncated, phase, capturedAt: iso(), frameUrl: location.href, ...(boxViewport ? { boxViewport } : {}) };
     } catch (e) {
       return { failed: true, reason: `DOMの直列化に失敗: ${String(e)}` };
     }
@@ -158,17 +182,59 @@ declare global { interface Window { __tracelensContent?: boolean } }
   let lastChange: { atMs: number; kind: ChangeKind } | null = null;
   let changeSentAt = 0;
   let changeT: number | undefined;
+  /** 間引いている範囲で最初に観測した変化の時刻（押下時の画面の判定に使う） */
+  let firstUnsent: number | undefined;
+  const sendChange = () => {
+    if (!lastChange) return;
+    void send({ t: 'change', atMs: lastChange.atMs, kind: lastChange.kind, ...(firstUnsent !== undefined ? { firstAtMs: firstUnsent } : {}) });
+    firstUnsent = undefined;
+  };
   function noteChange(kind: ChangeKind) {
+    notePressChange();
     if (!trackChanges) return;
     lastChange = { atMs: Date.now(), kind };
+    firstUnsent ??= lastChange.atMs;
     const now = Date.now();
-    if (now - changeSentAt >= 100) { changeSentAt = now; void send({ t: 'change', atMs: lastChange.atMs, kind }); }
-    else if (changeT === undefined) changeT = window.setTimeout(() => { changeT = undefined; changeSentAt = Date.now(); if (lastChange) void send({ t: 'change', atMs: lastChange.atMs, kind: lastChange.kind }); }, 100);
+    if (now - changeSentAt >= 100) { changeSentAt = now; sendChange(); }
+    else if (changeT === undefined) changeT = window.setTimeout(() => { changeT = undefined; changeSentAt = Date.now(); sendChange(); }, 100);
   }
   function flushChange() {
     if (changeT === undefined) return;
     clearTimeout(changeT); changeT = undefined; changeSentAt = Date.now();
-    if (lastChange) void send({ t: 'change', atMs: lastChange.atMs, kind: lastChange.kind });
+    sendChange();
+  }
+
+  // ---- 押下時の画面 -----------------------------------------------------------
+  // pointerdown の時点で SW に取得を始めさせる（クリックの処理で画面が変わる前の画像を残すため）。
+  // 押下の後に起きた操作（クリック・値の変更・入力の開始）の要素が押下した要素と対応するときだけ、その操作の手順に結びつける。
+  const PRESS_LINK_MS = 10000;
+  let press: { id: string; atMs: number; el: WeakRef<Element>; firstChangeAtMs: number | null } | null = null;
+  /** 取得後に位置を測り直すため、結びつけた後もしばらく要素を引けるようにする */
+  const pressEls = new Map<string, WeakRef<Element>>();
+  function notePressChange() {
+    if (!press || press.firstChangeAtMs !== null) return;
+    press.firstChangeAtMs = Date.now();
+    void send({ t: 'press-change', pressId: press.id, atMs: press.firstChangeAtMs });
+  }
+  function onPointerDown(e: PointerEvent) {
+    if (!e.isTrusted || pickerOn || !active() || scanning || e.button !== 0 || !e.isPrimary) return;
+    const raw = deepTarget(e);
+    if (!raw || isOwn(raw)) return;
+    const el = raw.closest(INTERACTIVE) || raw;
+    const tr = topRect(el);
+    press = { id: newId('prs'), atMs: Date.now(), el: new WeakRef(el), firstChangeAtMs: null };
+    pressEls.set(press.id, press.el);
+    if (pressEls.size > 10) pressEls.delete(pressEls.keys().next().value!);
+    void send({ t: 'press', pressId: press.id, atMs: press.atMs, rect: tr.rect, rectNote: tr.note, ...(isTop ? { viewport: pageInfo().viewport } : {}) });
+  }
+  /** 操作の手順に、対応する押下を結びつける（1 回の押下は 1 つの手順にだけ） */
+  function takePress(el: Element | null): StepDraft['press'] {
+    const p = press;
+    if (!p || !el || Date.now() - p.atMs > PRESS_LINK_MS) return undefined;
+    const pe = p.el.deref();
+    if (!pe || !pressRelated(pe, el)) return undefined;
+    press = null;
+    return { id: p.id, atMs: p.atMs, firstChangeAtMs: p.firstChangeAtMs };
   }
   function setTracking(on: boolean) {
     if (on === trackChanges) return;
@@ -248,7 +314,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
     return r.type === 'childList' && [...r.addedNodes, ...r.removedNodes].every((n) => (n as Element).tagName?.toLowerCase() === OVERLAY_TAG);
   };
   const mo = new MutationObserver((records) => {
-    if (trackChanges && !scanning && records.some((r) => !isOwnMutation(r))) noteChange('dom');
+    if ((trackChanges || press) && !scanning && records.some((r) => !isOwnMutation(r))) noteChange('dom');
     const o = obs;
     if (!o) return;
     let relevant = 0;
@@ -295,7 +361,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   let updateT: number | undefined;
   let lastFinal: { el: WeakRef<Element>; value: string | null } | null = null;
   const agg = new InputAggregator<Element>({
-    onStart(s) { accounted.add(s.key); emit(makeStep('input', s.key, { value: toValue(s) }, s.id), 'at-operation', s.key); },
+    onStart(s) { accounted.add(s.key); emit(makeStep('input', s.key, { value: toValue(s), press: takePress(s.key) }, s.id), 'at-operation', s.key); },
     onUpdate(s) {
       clearTimeout(updateT);
       updateT = window.setTimeout(() => { if (agg.current === s) void send({ t: 'patch', stepId: s.id, set: { value: toValue(s) } }); }, 800);
@@ -334,7 +400,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
     if (tag === 'label' && (el as HTMLLabelElement).control) return;
     if (isTextLike(el) && !(el as HTMLInputElement).readOnly) return;
     finalizeInput('other-operation');
-    const step = makeStep('click', el);
+    const step = makeStep('click', el, { press: takePress(el) });
     if (e.detail === 0) step.limitations.push({ code: 'synthetic-activation', message: 'ポインター操作ではないクリック（キーボード操作やフォームの暗黙送信で発生）の可能性がある' });
     emit(step, 'at-operation', el);
     beginObservation(step.id, 'after-operation');
@@ -356,7 +422,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
     const type = ((el as HTMLInputElement).type || '').toLowerCase();
     if (tag === 'select' || (tag === 'input' && (type === 'checkbox' || type === 'radio'))) {
       finalizeInput('other-operation');
-      const step = makeStep(tag === 'select' ? 'select' : 'check', el, { value: readValue(el) });
+      const step = makeStep(tag === 'select' ? 'select' : 'check', el, { value: readValue(el), press: takePress(el) });
       emit(step);
       beginObservation(step.id, 'after-operation');
       return;
@@ -485,6 +551,7 @@ declare global { interface Window { __tracelensContent?: boolean } }
   window.addEventListener('keydown', pickerKey, block);
   window.addEventListener('keyup', pickerKey, block);
   window.addEventListener('mousemove', pickerMove, opt);
+  window.addEventListener('pointerdown', onPointerDown, opt);
   window.addEventListener('click', onClick, opt);
   window.addEventListener('change', onChange, opt);
   window.addEventListener('input', onInput, opt);
@@ -592,6 +659,12 @@ declare global { interface Window { __tracelensContent?: boolean } }
     if (dead) return;
     if (msg.t === 'sync') { void sync(false); return; }
     if (msg.t === 'scan-begin' || msg.t === 'scan-scroll' || msg.t === 'scan-end') { if (isTop) handleScan(msg, sendResponse); return true; }
+    if (msg.t === 'press-rect') {
+      const el = pressEls.get(msg.pressId)?.deref();
+      if (!el) { if (isTop) sendResponse({ rect: null, viewport: pageInfo().viewport } satisfies PressRectReply); return; }
+      sendResponse({ rect: topRect(el).rect, ...(isTop ? { viewport: pageInfo().viewport } : {}) } satisfies PressRectReply);
+      return;
+    }
     if (msg.t === 'shot-meta') {
       const el = stepEls.get(msg.stepId)?.deref();
       if (!el && !isTop) return; // このフレームの要素ではない

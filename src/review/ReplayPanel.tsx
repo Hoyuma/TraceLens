@@ -8,6 +8,7 @@ import type { Scenario, Step } from '../shared/types';
 import { sendReplay } from '../ui/common';
 import { REPLAY_TARGET_LABEL, replayTargetLabel, planOriginPatterns, replayOptionsFor, resultCounts, type ReplayTarget } from './logic';
 import { fmtDateTime } from './ResultViews';
+import { UrlRewriteEditor } from './UrlRewriteEditor';
 
 interface Props {
   scenario: Scenario;
@@ -20,6 +21,7 @@ interface Props {
   onViewRun: (id: string | null) => void;
   onGoEdit: (stepId: string) => void;
   onSelectStep: (stepId: string) => void;
+  onChanged?: () => void;
 }
 
 /** 実行時の値が空でないか（secret は空欄を「未入力」とみなす） */
@@ -39,7 +41,7 @@ async function listTabCandidates(): Promise<TabCandidate[]> {
   } catch { return []; }
 }
 
-export function ReplayPanel({ scenario, steps, selId, session, replay, runs, viewRunId, onViewRun, onGoEdit, onSelectStep }: Props) {
+export function ReplayPanel({ scenario, steps, selId, session, replay, runs, viewRunId, onViewRun, onGoEdit, onSelectStep, onChanged }: Props) {
   const { lang } = useI18n();
   const [target, setTarget] = useState<ReplayTarget>('all');
   const [fromId, setFromId] = useState('');
@@ -63,7 +65,7 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
     if ('error' in optsRes) return { error: optsRes.error };
     try { return { plan: buildReplayPlan(scenario, steps, optsRes.opts) }; } catch (e) { return { error: (e as Error).message }; }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario.id, steps, target, selId, fromId, toId]);
+  }, [scenario.id, scenario.urlRewrites, steps, target, selId, fromId, toId]);
   const plan = 'plan' in planRes ? planRes.plan : [];
 
   const names = useMemo(() => planVariableNames(plan), [plan]);
@@ -257,6 +259,8 @@ export function ReplayPanel({ scenario, steps, selId, session, replay, runs, vie
               {pf.missingVariables.length > 0 && <div className="note warn" data-testid="replay-missing">{t('rp.missing', { list: pf.missingVariables.map((m) => t('rp.missingItem', { name: m.name, secret: m.secret ? t('rp.secretTag') : '', seqs: m.stepIds.map((id) => steps.find((s) => s.id === id)?.seq).join(', ') })).join(t('var.sep')) })}</div>}
             </div>
           )}
+
+          <UrlRewriteEditor scenario={scenario} steps={steps} onSaved={onChanged} />
 
           {origins.length > 0 && (
             <div style={{ marginTop: 8 }} data-testid="replay-origins">

@@ -7,12 +7,14 @@ import { getLang, t, trKnown } from '../ui/i18n';
 import type { Scenario, Step, StepReplayConfig } from '../shared/types';
 import { cleanReplayConfig, sameReplayConfig, undefinedTemplateVariables, validateReplayConfig, validateSelectorText } from './logic';
 import { WaitEditor } from './WaitEditor';
+import { DomPreviewDialog } from './DomPreviewDialog';
 
 const isSecretStep = (s: Step) => s.value?.kind === 'redacted' || !!s.value?.redacted;
 
 /** 手順ごとの再生設定。保存は「保存」ボタンで行い、検査に通らない内容は保存できない。 */
-export function StepReplayEditor({ step, scenario, onSaved }: { step: Step; scenario: Scenario; onSaved: () => void }) {
+export function StepReplayEditor({ step, scenario, steps, onSaved }: { step: Step; scenario: Scenario; steps?: Step[]; onSaved: () => void }) {
   const [draft, setDraft] = useState<StepReplayConfig>(step.replay ?? {});
+  const [preview, setPreview] = useState(false);
   const [msg, setMsg] = useState('');
   const set = (p: Partial<StepReplayConfig>) => { setDraft({ ...draft, ...p }); setMsg(''); };
   const vars = scenario.variables ?? [];
@@ -114,6 +116,12 @@ export function StepReplayEditor({ step, scenario, onSaved }: { step: Step; scen
             <input data-testid="replay-sel" className="grow" value={sel?.selector ?? ''} placeholder={t('sre.selPh')} onChange={(e) => set({ selector: { language: sel?.language ?? 'css', selector: e.target.value } })} />
             <button title={t('sre.selClearTitle')} disabled={!sel} onClick={() => { const { selector: _x, ...rest } = draft; setDraft(rest); setMsg(''); }}>{t('sre.selClear')}</button>
           </div>
+          {steps && <div className="row" style={{ marginTop: 4 }}><button data-testid="replay-sel-preview" onClick={() => setPreview(true)}>{t('pv.open')}</button><span className="small muted">{t('pv.openNote')}</span></div>}
+          {preview && steps && (
+            <DomPreviewDialog steps={steps} initialStepId={step.id}
+              initialSelector={sel?.selector ? sel : step.target?.selectors[0] ? { language: step.target.selectors[0].language, selector: step.target.selectors[0].selector } : null}
+              onPick={(p) => { set({ selector: p }); setPreview(false); }} onClose={() => setPreview(false)} />
+          )}
           {step.target && step.target.selectors.length > 0 && (
             <select data-testid="replay-sel-cand" style={{ marginTop: 4 }} value="" onChange={(e) => { const c = step.target!.selectors[Number(e.target.value)]; if (c) set({ selector: { language: c.language, selector: c.selector } }); }} aria-label={t('sre.pickCand')}>
               <option value="">{t('sre.pickCandOpt')}</option>

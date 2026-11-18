@@ -95,7 +95,12 @@ export interface Scenario {
   replacementRules: ReplacementRule[];
   /** (v2) */
   variables?: ScenarioVariable[];
+  /** (v2) 再生時の URL の置き換え。記録した URL は書き換えない。上から順に、最初に一致した規則を使う */
+  urlRewrites?: UrlRewrite[];
 }
+
+/** 再生時の URL の置き換え (v2)。from（先頭部分）に一致する URL を、再生時だけ to に置き換える */
+export interface UrlRewrite { id: string; from: string; to: string; enabled: boolean }
 
 export type StepKind =
   | 'session-start' | 'click' | 'input' | 'select' | 'check' | 'key'
@@ -330,6 +335,12 @@ export interface Step {
    * 未設定は、設定が無効だった（または参照を試みていない）という意味。
    */
   beforeScreenshot?: BeforeScreenshot;
+  /**
+   * (v2) 押下時の画面（任意設定。既定は有効）。ポインターを押した時点で取得を始めた表示領域の画像。
+   * クリックの処理（遷移・再描画）より前の画面を残すためのもの。取得の開始が押下より後であり、
+   * 押下から取得までの変化が写ることがある（notes に観測した内容を書く）。未設定は、設定が無効・押下がない操作。
+   */
+  pressScreenshot?: PressScreenshot;
 }
 
 /**
@@ -344,6 +355,18 @@ export interface BeforeScreenshot extends ArtifactRef {
   capturedAt?: ISO;
   /** 参照先の画像を持つ手順 */
   refStepId?: string;
+}
+
+/**
+ * 押下時の画面 (v2)。pointerdown を観測した直後に取得を始めた画像。
+ * 時刻は別々に持つ: pressAt（押下）、captureStartedAt（取得の開始）、capturedAt（取得の完了）。操作時刻（operationAt）とも別。
+ */
+export interface PressScreenshot extends ArtifactRef {
+  pressAt?: ISO;
+  captureStartedAt?: ISO;
+  capturedAt?: ISO;
+  /** 押下から取得の完了までに観測した画面変化・取得の順序についての注記 */
+  notes?: string[];
 }
 
 /** 手動取得した画像の取得方法と合成の情報 (v2) */
@@ -366,7 +389,7 @@ export interface CaptureInfo {
   notes: string[];
 }
 
-export type ArtifactPhase = 'session-start' | 'at-operation' | 'after-operation' | 'after-load' | 'manual' | 'session-end';
+export type ArtifactPhase = 'session-start' | 'at-press' | 'at-operation' | 'after-operation' | 'after-load' | 'manual' | 'session-end';
 
 export interface ScreenshotMeta {
   url?: string;
@@ -416,6 +439,11 @@ export interface Artifact {
   formState?: FormStateEntry[];
   truncated?: boolean;
   frameUrl?: string;
+  /**
+   * (v2) DOM の要素に data-tracelens-box（トップのビューポート基準の矩形, CSS px）を付けたときの、トップのビューポート。
+   * 省略は位置を記録していない（クロスオリジンのフレーム内など）。位置は DOM の取得時点のもので、画像の取得時刻とは別。
+   */
+  boxViewport?: { width: number; height: number; scrollX: number; scrollY: number };
 }
 
 export function emptyAnnotation(): Annotation {
@@ -456,6 +484,7 @@ export function normalizeScenario(s: Scenario): Scenario {
     groups: (s.groups ?? []).map((g) => ({ ...g, parentId: g.parentId ?? null })),
     replacementRules: (s.replacementRules ?? []).map((r) => ({ ...r, isRegex: !!r.isRegex })),
     variables: s.variables ?? [],
+    urlRewrites: s.urlRewrites ?? [],
   };
 }
 
@@ -464,6 +493,6 @@ export function normalizeStep(s: Step): Step {
 }
 
 export const PHASE_LABEL: Record<ArtifactPhase, string> = {
-  'session-start': '記録開始時の画面', 'at-operation': '操作時点', 'after-operation': '操作後の画面',
+  'session-start': '記録開始時の画面', 'at-press': '押下時の画面', 'at-operation': '操作時点', 'after-operation': '操作後の画面',
   'after-load': '読み込み後の画面', manual: '手動保存した画面', 'session-end': '記録終了時の画面',
 };
